@@ -107,17 +107,27 @@ bash scripts/eval_fastwam_libero.sh --arm cae --steps 4 --smoke
 
 ## Reproducing the blog results
 
-Each script runs one set of published configurations on CPU MuJoCo, with the
-`--sim instinct` twin of each run commented out beneath it. Its header lists the
-checkpoints it needs.
+```bash
+# Baselines: FastWAM and DiT4DiT on LIBERO, DiT4DiT on RoboCasa-GR1
+bash scripts/reproduce_baselines.sh
 
-| Script | Runs |
-|---|---|
-| [`scripts/reproduce_baselines.sh`](scripts/reproduce_baselines.sh) | FastWAM and DiT4DiT on LIBERO, DiT4DiT on RoboCasa-GR1 |
-| [`scripts/reproduce_training_free.sh`](scripts/reproduce_training_free.sh) | Baseline, GEAK, and GEAK with fewer denoising steps: success rate and latency |
-| [`scripts/reproduce_cae_fastwam.sh`](scripts/reproduce_cae_fastwam.sh) | CAE-FastWAM next to the FastWAM baseline and GEAK: success rate and latency |
-| [`scripts/reproduce_cae_dit4dit.sh`](scripts/reproduce_cae_dit4dit.sh) | CAE-DiT4DiT on RoboCasa-GR1 full-24; needs a CAE-DiT4DiT checkpoint you train (see [Training](#training)) |
-| [`scripts/run_all_evals.sh`](scripts/run_all_evals.sh) | Every documented launch: each launcher, arm and step count |
+# Training-free optimization: baseline, GEAK, and GEAK with fewer denoising steps
+bash scripts/reproduce_training_free.sh
+
+# CAE-FastWAM on LIBERO, next to the FastWAM baseline and GEAK
+bash scripts/reproduce_cae_fastwam.sh
+
+# CAE-DiT4DiT on RoboCasa-GR1 full-24 (needs a checkpoint you train; see Training)
+bash scripts/reproduce_cae_dit4dit.sh
+
+# Every documented launch: each launcher, arm and step count
+bash scripts/run_all_evals.sh
+```
+
+Each script runs its configurations once on CPU MuJoCo, with the
+`--sim instinct` twin of each run commented out beneath it, and writes results
+under `REPRO_DIR` (default `eval/outputs/<script name>`). The header of each
+script lists the checkpoints and environment variables it needs.
 
 ## Latency tools
 
