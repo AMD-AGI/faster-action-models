@@ -1,0 +1,18 @@
+# Security updates only: the pinned environments and the frozen src/ trees are
+# records of what was evaluated, so routine version-bump PRs are disabled.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directories:
+      - /FastWAM
+      - /DiT4DiT
+      - /DiT4DiT/environments
+      - /src/dit4dit-baseline
+      - /src/dit4dit-geak
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly

@@ -1,0 +1,12 @@
+# @package _global_
+# Per-suite eval variant of libero_uncond_2cam224_1e-4_32hdim_latent_K8d16_freebits_pernorm_joint.
+# Adds the suite id the suite-conditioned action-VAE needs, and takes the
+# action-VAE checkpoint from ACTION_VAE_CKPT: the base yaml's path is relative
+# and torch.load resolves it against the CWD, which is the harness checkout.
+defaults:
+  - libero_uncond_2cam224_1e-4_32hdim_latent_K8d16_freebits_pernorm_joint
+  - _self_
+
+model:
+  action_vae_ckpt: ${oc.env:ACTION_VAE_CKPT}
+  action_vae_suite_id: 0

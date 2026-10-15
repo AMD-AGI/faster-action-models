@@ -1,0 +1,41 @@
+# @package _global_
+# 32-hidden-dim + K8/d16 free-bits VAE + per-suite normalization.
+defaults:
+  - override /data: libero_2cam
+  - override /model: fastwam_32hdim_latent_b4_joint
+  - _self_
+
+batch_size: 64
+num_workers: 8
+
+data:
+  train:
+    dataset_dirs:
+      - /dev/shm/libero_spatial_no_noops_lerobot
+      - /dev/shm/libero_object_no_noops_lerobot
+      - /dev/shm/libero_goal_no_noops_lerobot
+      - /dev/shm/libero_10_no_noops_lerobot
+    per_dataset_norm_stats:
+      - runs/per_suite_stats/dataset_stats_libero_spatial.json
+      - runs/per_suite_stats/dataset_stats_libero_object.json
+      - runs/per_suite_stats/dataset_stats_libero_goal.json
+      - runs/per_suite_stats/dataset_stats_libero_10.json
+    text_embedding_cache_dir: /dev/shm/text_embeds_cache_libero
+
+model:
+  mot_checkpoint_mixed_attn: false
+  action_vae_ckpt: checkpoints/cascade/vae_approachB/vae_B4_allsuites_softprompt_pernorm_freebits_K8_dz16.pt
+  loss:
+    lambda_video: 1.0
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 2000
+eval_every: 200
+
+gradient_accumulation_steps: 1
+weight_decay: 1e-2
+resume: null

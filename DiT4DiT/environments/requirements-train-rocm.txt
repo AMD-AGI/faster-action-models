@@ -1,0 +1,21 @@
+# Captured CAE-DiT4DiT production training userspace (Python 3.12.3).
+# Install the ROCm 7.2 PyTorch 2.10.0a0+git449b176 base image separately.
+# Security bumps since capture (Dependabot): accelerate 1.12.0 -> 1.15.0, pyarrow 23.0.0 -> 23.0.1.
+accelerate==1.15.0
+albumentations==1.4.18
+decord==0.6.0
+deepspeed==0.18.5
+diffusers @ git+https://github.com/huggingface/diffusers.git@3996788b602eaae4da41a1d45726b62e662b73cf
+huggingface-hub==0.36.2
+numpy==2.5.2
+numpydantic==1.6.9
+omegaconf==2.3.0
+opencv-python-headless==5.0.0.93
+pandas==2.2.3
+peft==0.18.1
+pyarrow==23.0.1
+safetensors==0.5.3
+transformers==4.57.6
+tyro==1.0.9
+wandb==0.23.1
+websockets==16.0

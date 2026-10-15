@@ -1,0 +1,12 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Build environment for the GPU simulator's Python module, layered on the image that will RUN the sim clients, so the
+# extension is compiled against that image's Python (3.12) and ROCm 7.14 wheel runtime. The run image is unchanged;
+# only the build uses this one.
+#
+#   docker build -f simulate/docker/Dockerfile.build --build-arg BASE=<sim client image> -t <tag> simulate/docker
+ARG BASE
+FROM ${BASE}
+USER root
+RUN /opt/venv/bin/pip install --no-cache-dir --index-url https://repo.amd.com/rocm/whl-multi-arch rocm-sdk-devel==7.14.0 \
+ && /opt/venv/bin/pip install --no-cache-dir pybind11 && /opt/venv/bin/rocm-sdk init

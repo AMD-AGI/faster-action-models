@@ -1,0 +1,118 @@
+# RUNNABLE example: GEAK on FastWAM / LIBERO, MI355X (gfx950).
+#
+# Copy to ../config.yaml, export the variables in geak/README.md, seed src/ with
+# the four files below from your FastWAM checkout, and launch. Nothing here is a
+# placeholder.
+#
+# Deliberately contains NO dead-end list and NO measured economics. Those come
+# from YOUR first campaign -- fill the marked sections in afterwards and the next
+# campaign will be markedly more efficient. This file is the cold-start version.
+
+source_file_path:
+- src/mot.py                 # mixture-of-transformers: denoise loop + video prefill
+- src/wan_video_dit.py       # video DiT blocks
+- src/wan_video_vae.py       # Wan VAE (observation encode)
+- src/action_dit.py          # action expert
+
+target_kernel_functions:
+- FastWAM.infer_action
+- FastWAM._denoise_action_with_video_cache
+- MoT.forward_action_with_video_cache_tensor
+- MoT.prefill_video_cache_tensor
+- WanVideoVAE.single_encode
+- Encoder3d.forward
+- ActionDiT.pre_dit
+- ActionDiT.post_dit
+- flash_attention
+- rope_apply
+- RMSNorm
+
+compile_command:
+- bash run_local.sh compile
+correctness_command:
+- bash run_local.sh correctness
+performance_command:
+- bash run_local.sh performance
+
+task_type: pytorch2pytorch
+
+prompt:
+  source_code: null
+  instructions: |
+    Optimize FastWAM's END-TO-END action inference (`FastWAM.infer_action`) on
+    AMD Instinct™ MI355X (gfx950, CDNA4). The editable files are src/mot.py,
+    src/wan_video_dit.py, src/wan_video_vae.py and src/action_dit.py. The scored
+    metric is the whole call on the real model and real checkpoint, measured at
+    two denoise-step counts and combined by geomean:
+
+      episode_1step   num_inference_steps=1    prologue-dominated
+      episode_10step  num_inference_steps=10   denoise-dominated
+
+    Both are scored deliberately. The prologue (VAE encode + video prefill) is
+    paid ONCE per call regardless of step count, so it is a large share of the
+    1-step case and a small share of the 10-step case. A patch that speeds the
+    denoise step while slowing the prologue wins at 10 steps and loses at 1;
+    scoring the geomean means neither stage can be traded away for the other.
+
+    *** PROFILE BEFORE PICKING A LEVER ***
+    Do not assume where the time is. Run an in-process torch.profiler pass over
+    BOTH the denoise step and the video prefill and report, before proposing any
+    direction: kernel launches per call, CPU launch time vs wall clock, and the
+    gpu_busy fraction. That tells you whether you are chasing the host or the
+    device. Note `rocprof-compute` may be unusable on this stack; in-process
+    torch.profiler is sufficient and is what the decisive metrics come from.
+
+    The per-stage breakdown (vae / pre_dit / prefill / per-step) is printed for
+    every case by the performance command. Use it to see which stage a patch
+    actually moved rather than inferring it from the total.
+
+    *** SHAPES ARE VERIFIED AT RUNTIME -- DO NOT ASSUME A LONGER CACHE ***
+    batch=1, action_seq=32, video_seq=98 (KV-cached), S_kv=130, ctx=129, bf16,
+    30 layers, observation 224x448 (two cameras concatenated). `infer_action`
+    prefills a SINGLE frame, so the video cache is 98 tokens. The harness
+    intercepts what prefill actually receives and HARD-FAILS on a mismatch. Do
+    not attempt to prune or compress the video KV cache: at this shape the mask
+    admits every video column, so it is a no-op.
+
+    *** HAZARDS ***
+    1. ZERO GIT CONFLICT IS NOT EVIDENCE OF COMPOSITION. Patches can apply
+       cleanly to disjoint files and still be semantically broken -- compiling,
+       passing correctness, and silently disabling one another. When one patch
+       adds a custom op that re-launches another's kernel, diff the LAUNCH
+       CONFIGURATION, and treat every newly-added constexpr default as a
+       silent-fallback hazard.
+    2. SHIP KILL-SWITCHES AND VERIFY THE DEFAULT by running the OFF arm and
+       confirming it reproduces the previous tree to several digits. A switch
+       whose default was never tested is not a switch.
+    3. Eager microbenchmarks SYSTEMATICALLY OVERSTATE wins that will be realised
+       inside torch.compile. REGION profiles do not decide -- a region win can be
+       a full-stack regression. Confirm on the full metric.
+
+    *** MEASUREMENT ***
+    Measure the run-to-run spread of the scored geomean on the UNMODIFIED tree
+    first, and treat anything smaller as unresolved. Re-measure interleaved
+    (for round: for arm) before reporting a small delta.
+
+    *** CORRECTNESS: TWO GATES, BOTH MUST PASS ***
+    A numerics oracle runs first as a cheap pre-filter, then real MuJoCo LIBERO
+    episodes against a persistent model server. THE ROLLOUT IS THE AUTHORITY.
+
+    The oracle replays ONE input, so it is structurally blind to cross-episode
+    state staleness -- exactly what caching and graph capture introduce. The eval
+    server reuses ONE model across episodes and calls prefill with a NEW video
+    each time. Therefore: any state cached on `self` (KV buffers, captured
+    graphs, static input/output buffers) MUST be invalidated when the incoming
+    video cache changes. Invalidate by COUNTER, never by data_ptr/_version
+    identity -- the caching allocator hands back the same addresses next episode,
+    so identity-keyed invalidation silently serves stale data. Never return a
+    graph's internal static output buffer to the caller; return a clone.
+
+    Keep fp32 accumulation. Custom Triton must be static-shape and guarded with
+    torch.compiler.is_compiling() fallbacks.
+
+    *** FILL THESE IN AFTER YOUR FIRST CAMPAIGN ***
+    Measured baseline: <...>
+    Per-stage economics (what 1 ms in each stage is worth on the geomean): <...>
+    Levers already in the tree: <...>
+    Dead ends, WITH MECHANISM and the measured number: <...>
+  cheatsheet: null

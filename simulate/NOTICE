@@ -1,0 +1,8 @@
+GPU-native simulation (simulate/)
+Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This directory includes third-party software: portions of MuJoCo and MuJoCo Warp (Apache-2.0) and TinyXML-2
+(zlib).
+See THIRD_PARTY_NOTICES.md at the repository root.

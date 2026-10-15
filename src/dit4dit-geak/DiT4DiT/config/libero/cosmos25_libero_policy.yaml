@@ -1,0 +1,92 @@
+run_id: cosmos-policy
+run_root_dir: results/Checkpoints
+seed: 42
+trackers: [jsonl, wandb]
+wandb_entity: your_wandb_entity
+wandb_project: DiT4DiT
+is_debug: false
+
+framework:
+  name: DiT4DiT
+  cosmos25:
+    future_num_inference_steps: 10
+    future_loss_type: flow_matching
+    extract_layer: 17
+    base_model: /path/to/checkpoints/Cosmos-Predict2.5-2B
+    attn_implementation: flash_attention_2
+    vl_hidden_dim: 2048
+    training: policy
+    flow_matching:
+      time_distribution: logit_normal
+      high_sigma_ratio: 0.05
+      high_sigma_min: 0.98
+    conditional_frame_timestep: 0.0001
+
+  action_latent:
+    action_dim: 7
+    action_horizon: 8
+    state_dim: 8
+    latent_channels: 16
+    latent_h: 28
+    latent_w: 28
+    dataset_statistics: /path/to/checkpoints/dit4dit-model/dit4dit_libero/dataset_statistics.json
+
+  training_mode_probs:
+    policy: 0.67
+    world_model: 0.33
+
+datasets:
+  vla_data:
+    dataset_py: lerobot_datasets
+    data_root_dir: /path/to/libero_data
+    data_mix: libero_all
+    include_state: true
+    action_type: joint_position
+    default_image_resolution: [3, 224, 224]
+    per_device_batch_size: 1
+    load_all_data_for_training: true
+    obs: ["image_0"]
+    image_size: [224, 224]
+    delete_pause_frame: false
+    video_delta_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    max_state_dim: 16
+    max_action_dim: 8
+    action_video_freq_ratio: 2
+    video_backend: torchvision_av
+
+trainer:
+  epochs: 100
+  max_train_steps: 100000
+  num_warmup_steps: 5000
+  save_interval: 5000
+  eval_interval: 100
+  learning_rate:
+    base: 1e-05
+    backbone_interface: 1.0e-05
+  lr_scheduler_type: cosine_with_min_lr
+  scheduler_specific_kwargs:
+    min_lr: 5.0e-07
+  freeze_modules: 'backbone_interface.extractor.text_encoder,backbone_interface.extractor.vae'
+  repeated_diffusion_steps: 4
+  max_grad_norm: 1.0
+  warmup_ratio: 0.1
+  weight_decay: 0.0
+  logging_frequency: 10
+  gradient_clipping: 1.0
+  gradient_accumulation_steps: 4
+
+  loss_scale:
+    future_video: 0.5
+    action_decoded: 10.0
+
+  optimizer:
+    name: AdamW
+    betas: [0.9, 0.95]
+    eps: 1.0e-08
+    weight_decay: 1.0e-08
+
+  is_resume: false
+  resume_epoch: null
+  resume_step: null
+  enable_gradient_checkpointing: true
+  enable_mixed_precision_training: true

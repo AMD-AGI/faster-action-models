@@ -1,0 +1,15 @@
+diff --git a/robocasa/utils/gym_utils/gymnasium_basic.py b/robocasa/utils/gym_utils/gymnasium_basic.py
+index 91b1103..ac7d74f 100644
+--- a/robocasa/utils/gym_utils/gymnasium_basic.py
++++ b/robocasa/utils/gym_utils/gymnasium_basic.py
+@@ -212,6 +212,10 @@ class RoboCasaEnv(gym.Env):
+ 
+     def reset(self, seed=None, options=None):
+         np.random.seed(seed)
++        if seed is not None:
++            # RoboCasa samples layouts, objects, cameras, and robot state from
++            # this Generator. Gymnasium's seed alone only resets its own RNG.
++            self.env.rng = np.random.default_rng(seed)
+         raw_obs = self.env.reset()
+         # return obs
+         obs = self.get_basic_observation(raw_obs)

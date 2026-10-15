@@ -1,0 +1,11 @@
+FastWAM LIBERO checkpoints
+Copyright (c) 2026 Advanced Micro Devices, Inc.
+
+These checkpoints contain a modified version of Wan2.2-TI2V-5B
+(https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B, Wan Team, Alibaba), licensed
+under the Apache License, Version 2.0. The Wan2.2-TI2V-5B weights were
+fine-tuned by Advanced Micro Devices, Inc. using the FastWAM training recipe
+(https://github.com/yuantianyuan01/FastWAM, MIT License).
+
+Training data: LIBERO (Liu et al., NeurIPS 2023; CC BY 4.0), in the LeRobot
+format published as yuanty/LIBERO-fastwam (CC BY 4.0).

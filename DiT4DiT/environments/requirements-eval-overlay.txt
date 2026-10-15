@@ -1,0 +1,5 @@
+# Install these into a separate --target directory and pass that directory to
+# run_full24_evaluation.py --robosuite-overlay.
+numpy==1.26.4
+mujoco==3.2.6
+robosuite==1.5.1

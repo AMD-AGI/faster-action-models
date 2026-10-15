@@ -1,0 +1,2484 @@
+--- a/diffusers/models/transformers/transformer_cosmos.py
++++ b/diffusers/models/transformers/transformer_cosmos.py
+@@ -34,6 +34,1281 @@
+     from torchvision import transforms
+ 
+ 
++# ---------------------------------------------------------------------------
++# GEAK levers (each has an env kill-switch; all default ON, all EXACT rewrites)
++#   GEAK_DIT_ADALN=0     -> disable the compact (per-frame) AdaLN modulation path
++#   GEAK_DIT_TXTCACHE=0  -> disable crossattn-projection / cross-attn K,V memoization
++#   GEAK_DIT_RIGUARD=0   -> disable the "skip repeat_interleave when ratio == 1" guard
++# ---------------------------------------------------------------------------
++import os as _geak_os
++
++
++def _geak_flag(name: str, default: str = "1") -> bool:
++    return str(_geak_os.environ.get(name, default)).strip() not in ("0", "false", "False", "")
++
++
++_GEAK_ADALN = _geak_flag("GEAK_DIT_ADALN")
++_GEAK_TXTCACHE = _geak_flag("GEAK_DIT_TXTCACHE")
++_GEAK_RIGUARD = _geak_flag("GEAK_DIT_RIGUARD")
++_GEAK_VERIFY = _geak_flag("GEAK_DIT_VERIFY", "0")   # debug: run both paths and print the delta
++_GEAK_RMS = _geak_flag("GEAK_DIT_RMS")             # fused F.rms_norm for the QK norms
++_GEAK_ROPE = _geak_flag("GEAK_DIT_ROPE")           # fused RoPE + cached RoPE/pos-embed tables
++_GEAK_QKV = _geak_flag("GEAK_DIT_QKV")             # fused Q/K/V GEMM + joint q,k RoPE for self-attn
++_GEAK_DIRECT = _geak_flag("GEAK_DIT_DIRECT")       # call the attn processor directly (skips
++                                                   # diffusers' per-call inspect.signature())
++# ROUND 2 -- GEAK_DIT_NOAC: run the transformer-block loop with autocast DISABLED.
++# Measured (rocprofv3-cross-checked torch trace, 4-step): the caller wraps the video
++# DiT in torch.autocast(bf16).  `layer_norm` sits on autocast's *fp32* cast policy, so
++# every one of the 54 AdaLN LayerNorms UP-CASTS its bf16 [1,2,196,2048] activation to
++# fp32 (54 x 3.24 us), runs the fp32 norm, and hands an fp32 tensor to the modulation
++# addcmul -- which then has to promote BOTH tiny bf16 modulation operands to fp32
++# (108 x 3.40 us = 0.368 ms of pure launch on 4096-element tensors) -- and finally
++# autocast casts the fp32 result BACK to bf16 for the next GEMM (54 x 2.94 us).
++# 216 dispatches and ~0.87 ms per iteration exist only to move between two dtypes.
++# Everything in this loop (weights AND activations) is already bf16, so autocast is a
++# no-op for every op here EXCEPT layer_norm; disabling it keeps the identical GEMM /
++# attention / gelu arithmetic and changes only where the bf16 rounding happens
++# (LayerNorm still accumulates its mean/var in fp32 -- `vectorized_layer_norm_kernel
++# <BFloat16, float>` -- it just rounds the result to bf16 before the modulation instead
++# of after it).  Worst case is one extra bf16 round on the AdaLN intermediate.
++_GEAK_NOAC = _geak_flag("GEAK_DIT_NOAC")
++# GEAK_DIT_NORMPRE: apply the QK RMS-norm on the contiguous [B, S, H, D] layout and
++# transpose afterwards, instead of transposing first and letting `_fused_rms_norm`
++# insert a `.contiguous()` clone.  Bitwise identical, one fewer full-tensor copy.
++_GEAK_NORMPRE = _geak_flag("GEAK_DIT_NORMPRE")
++# GEAK_DIT_QKV2: keep the fused-QKV self-attention in B,S,H,D from the GEMM to SDPA
++# (see the long comment at the call site).  Removes 2 rms-norm contiguous clones, one
++# torch.stack and SDPA's own input copy per block.
++_GEAK_QKV2 = _geak_flag("GEAK_DIT_QKV2")
++# GEAK_DIT_ROLLROPE: fold the q/k RMS gains into the RoPE tables and replace
++# neg+cat with a single torch.roll.  Same fp32 multiply-accumulate, 3 kernels
++# instead of 5, and one FEWER bf16 rounding (the gain is applied in fp32 inside
++# the table instead of in bf16 on the activation).
++# MEASURED VERDICT: LOSES in the full model (+0.28 ms geomean, twice, interleaved)
++# even though the isolated microbenchmark says 43.6 -> 25.6 us per block.  The folded
++# tables are per-BLOCK ([2,1,S,1,D] x 18 = 14.5 MB) where the shared cos/sin table is
++# 0.4 MB reused by all 18 blocks, so the eager win is eaten by cache locality.
++# Kept in source, DEFAULT OFF, as a recorded dead end.
++_GEAK_ROLLROPE = _geak_flag("GEAK_DIT_ROLLROPE", "0")
++
++# GEAK r4_d2: the timestep embedding is a pure function of the timestep VECTOR.
++# On the deployed path that vector is [conditional_frame_timestep, sigma_0]
++# broadcast over the frame axis -- a schedule constant that never changes for the
++# life of an episode -- yet `time_embed` rebuilds it every call: Timesteps'
++# sinusoidal table (arange/exp/mul/cat/sin/cos/cat), a type_as, Linear->SiLU->
++# Linear and an RMSNorm.  ~14 dispatches at <=8 CTAs of pure launch floor inside
++# region B.  Memoised on the OBJECT IDENTITY of the incoming timestep tensor
++# (Cosmos25 hands us a memoised device constant under GEAK_DIT_PREB), with the
++# tensor itself held in the cache entry -- so the key can never be recycled and
++# the result is pinned for a HIP graph's lifetime.  A caller that builds a fresh
++# timestep tensor per call simply misses and pays the stock path.
++_GEAK_TEMB = _geak_flag("GEAK_DIT_TEMB")
++# GEAK r4_d2: the transformer prologue rebuilds its own input every call --
++#   cat(latents, condition_mask) ; resize(padding_mask) ; repeat ; cat
++# = 4 dispatches, three of which move tensors that never change.  Pack once into
++# a persistent [B, C+2, T, H, W] buffer whose two trailing channels are written
++# ONCE, and copy only the live latent channels per call: 4 dispatches -> 1.
++_GEAK_PREPACK = _geak_flag("GEAK_DIT_PREPACK")
++
++# ---------------------------------------------------------------------------
++# ROUND 6 -- GEAK_DIT_INFMEMO.  THE FOUR MEMOS ABOVE WERE SILENTLY DISABLED.
++#
++# Every call-invariant memo in this file guards itself with
++# `not torch.is_grad_enabled()`.  On torch 2.11 that predicate is FALSE inside
++# `torch.inference_mode()`: InferenceMode no longer clears GradMode, it only
++# marks the produced tensors as inference tensors.  MEASURED in this process
++# (print at the top of `CosmosRotaryPosEmbed.forward`, deployed path):
++#
++#     torch.is_grad_enabled()            -> True
++#     torch.is_inference_mode_enabled()  -> True
++#     hidden_states.requires_grad        -> False
++#
++# `predict_action` is `@torch.inference_mode()`, so ALL FOUR of GEAK_DIT_ROPE's
++# two caches, GEAK_DIT_TEMB and GEAK_DIT_PREPACK have been dead since they were
++# written, and their ~45 nodes are baked into the captured backbone graph and
++# replayed on every call.  Confirmed in the kernel trace: region B still shows
++# the three `1/(theta**range)` chains, the cat, the cos/sin pair, the timestep
++# sin/cos/cat and BOTH time-embedding GEMMs, all at 1-49 CTAs.
++#
++# The fix is the predicate, not the caches.  Autograd is genuinely off in
++# inference mode (no graph is recorded, nothing can be backwarded through), so
++# memoising is exactly as safe there as under `no_grad`.
++#
++# Kill switch: GEAK_DIT_INFMEMO=0 restores the literal `not is_grad_enabled()`
++# test, i.e. the round-5 behaviour (all four memos off) bit for bit.
++_GEAK_INFMEMO = _geak_flag("GEAK_DIT_INFMEMO")
++
++
++def _geak_memo_ok() -> bool:
++    """True when autograd cannot observe us, so a call-invariant memo is legal."""
++    if not torch.is_grad_enabled():
++        return True
++    if not _GEAK_INFMEMO:
++        return False
++    try:
++        return bool(torch.is_inference_mode_enabled())
++    except AttributeError:
++        return False
++
++from torch.nn.modules import module as _geak_nnmod
++
++# ---------------------------------------------------------------------------
++# ROUND 3 -- GEAK_DIT_FUSELN: fold the residual-add / LayerNorm / AdaLN-affine
++# chain of the transformer-block loop into ONE triton kernel with TWO outputs.
++#
++# MEASURED SHAPE OF THE PROBLEM (round-2 tree, 4-step): region C is no longer a
++# fill problem -- only 21% of its dispatches underfill.  It is kernel-COUNT and
++# bandwidth bound.  Per block the loop issues, three times over,
++#     hs4 = addcmul(hs4, attn_out, gate)      # 784-CTA elementwise
++#     t   = LayerNorm(hs4)                    # 392-CTA vectorized_layer_norm
++#     nh  = addcmul(shift, t, one_plus_scale) # 784-CTA elementwise
++# = 9 separately dispatched full passes over the same [1,2,196,4096] bf16
++# activation, 162 elementwise launches (0.824 ms = 7.0% of ALL GPU busy) plus 90
++# layer-norm launches (0.639 ms).  They are WELL FILLED -- the lever is not grid
++# width, it is that the data is read and written three times instead of once.
++#
++# The fused kernel keeps one program per row (392 rows of 4096), loads hs4 and
++# the attention output once, and emits BOTH the new residual and the normalised+
++# modulated tensor the next stage consumes.  9 kernels/block -> 3, and the
++# chain's HBM traffic falls from 22.4 MB to 12.8 MB per group.
++#
++# The consumer of `nh` is the NEXT stage's attention/FF, and the producer of the
++# residual is the PREVIOUS stage -- so the fusion boundary does not line up with
++# the block boundary.  `_geak_forward_fused` therefore carries `nh` across the
++# block seam: one LayerNorm before the loop, one plain addcmul after the last
++# block, and 3 fused kernels per block in between.
++#
++# NUMERICS: every intermediate is rounded to the activation dtype at exactly the
++# points torch rounds it (residual after the addcmul, the norm result before the
++# affine, the affine result), and mean/variance accumulate in fp32 as
++# `vectorized_layer_norm_kernel<BFloat16, float>` does.  The only difference is
++# the reduction ORDER inside the 4096-element mean/var (block reduction vs
++# torch's Welford), i.e. sub-ULP on an fp32 accumulator feeding a bf16 output.
++# ---------------------------------------------------------------------------
++_GEAK_FUSELN = _geak_flag("GEAK_DIT_FUSELN")
++
++_GEAK_TRITON_OK = True
++try:
++    import triton as _geak_triton
++    import triton.language as _geak_tl
++except Exception:  # pragma: no cover -- triton always present on this stack
++    _GEAK_TRITON_OK = False
++
++if _GEAK_TRITON_OK:
++
++    @_geak_triton.jit
++    def _geak_addln_kernel(
++        X, A, G, SH, SC, R, O,
++        s_bt, HW, eps,
++        C: _geak_tl.constexpr, BLOCK: _geak_tl.constexpr,
++    ):
++        row = _geak_tl.program_id(0)
++        gt = row // HW
++        od = _geak_tl.arange(0, BLOCK)
++        m = od < C
++        x = _geak_tl.load(X + row * C + od, mask=m, other=0.0).to(_geak_tl.float32)
++        a = _geak_tl.load(A + row * C + od, mask=m, other=0.0).to(_geak_tl.float32)
++        g = _geak_tl.load(G + gt * s_bt + od, mask=m, other=0.0).to(_geak_tl.float32)
++        r = (x + a * g).to(R.dtype.element_ty)
++        _geak_tl.store(R + row * C + od, r, mask=m)
++        rf = _geak_tl.where(m, r.to(_geak_tl.float32), 0.0)
++        mu = _geak_tl.sum(rf, 0) / C
++        d = _geak_tl.where(m, rf - mu, 0.0)
++        var = _geak_tl.sum(d * d, 0) / C
++        y = (d * _geak_tl.rsqrt(var + eps)).to(O.dtype.element_ty).to(_geak_tl.float32)
++        sh = _geak_tl.load(SH + gt * s_bt + od, mask=m, other=0.0).to(_geak_tl.float32)
++        sc = _geak_tl.load(SC + gt * s_bt + od, mask=m, other=0.0).to(_geak_tl.float32)
++        _geak_tl.store(O + row * C + od, (sh + y * sc).to(O.dtype.element_ty), mask=m)
++
++
++# ROUND 5 -- GEAK_DIT_LNCFG: launch config of the fused add+LN kernel, re-swept
++# COLD (24 rotating 3.2 MB input pairs = 154 MB, so no launch reuses an
++# L2-resident buffer).  The round-3 default (8 warps, 1 stage) reads 4.37 us on
++# the real [392, 2048] shape; (4 warps, 2 stages) reads 3.59 us, -18%, and the
++# whole ranking is different from the hot sweep.  For reference the SAME 6.4 MB
++# moved by two plain torch copies costs 5.87 us, so the kernel is already past
++# the elementwise machine limit -- this is the last 18%, not a rewrite.
++# Same for the fused QK+RoPE kernel: 3.93 -> 3.67 us at 2 stages.
++_GEAK_LNCFG = _geak_flag("GEAK_DIT_LNCFG")
++_GEAK_FUSELN_WARPS = int(_geak_os.environ.get(
++    "GEAK_DIT_FUSELN_WARPS", "4" if _GEAK_LNCFG else "8"))
++_GEAK_FUSELN_STAGES = int(_geak_os.environ.get(
++    "GEAK_DIT_FUSELN_STAGES", "2" if _GEAK_LNCFG else "1"))
++_GEAK_FUSELN_MODE = int(_geak_os.environ.get("GEAK_DIT_FUSELN_MODE", "1"))
++# MEASURED, and the reason a device-only win was a wall-clock LOSS on the first
++# attempt: region C is HOST-ISSUE bound (block-loop issue 5.0-5.5 ms against a
++# 5.66 ms region wall and 4.9 ms of device busy), and triton's *python* launcher
++# costs 13.2 us per call on this stack -- 24 us in-model -- against 4-5 us for a
++# torch elementwise op.  Fusing 3 torch ops (15-17 us of host) into one JIT-
++# launched triton kernel therefore ADDED ~7 us of host per stage and lost 0.76 ms
++# e2e even though it removed 1.0 ms of DEVICE time.  Launching the already-
++# compiled `CompiledKernel` directly skips JITFunction.run's signature hashing,
++# specialization lookup and arg binding: 13.2 us -> 5.9 us per launch, measured on
++# this box.  The JIT path stays as the fallback (and as the compile step).
++_GEAK_FUSELN_FAST = _geak_flag("GEAK_DIT_FUSELN_FAST")
++_geak_addln_cache = {}
++
++# ---------------------------------------------------------------------------
++# ROUND 3 -- GEAK_DIT_FUSEQK: the self-attention Q/K preparation, one kernel.
++#
++# The fused-QKV path currently spends EIGHT separate elementwise dispatches per
++# block turning the projection output into rotated q/k:
++#     torch.stack((t[:,:,0], t[:,:,1]))      cat            [2,B,S,H,D] bf16
++#     F.rms_norm(qk, (D,), None, eps)        _fused_rms_norm
++#     qk * wqk                               mul
++#     cat([-x_imag, x_real])                 neg + cat
++#     x * cos                                mul            -> fp32, 6.4 MB
++#     addcmul(., x_rot, sin)                 addcmul        -> fp32, 6.4 MB
++#     .to(bf16)                              copy
++# 8 dispatches x 18 blocks = 144 of region C's ~500, and two of the temporaries
++# are fp32 (the cos/sin tables are fp32, so the multiply promotes).
++#
++# One kernel, one program per token, does all of it: it loads the q and k rows
++# of the projection output TWICE -- once at d and once at (d + D/2) mod D, both
++# from the same cache lines -- so the RoPE "rotate half" needs no separate
++# neg/cat tensor at all, and the fp32 intermediates never reach HBM.
++#
++# NUMERICS: identical op order and identical rounding points (rms result -> bf16,
++# gain -> bf16, rope accumulated in fp32 -> bf16); only the 128-element mean-square
++# reduction order can differ from torch's, i.e. sub-ULP on an fp32 accumulator.
++# ---------------------------------------------------------------------------
++_GEAK_FUSEQK = _geak_flag("GEAK_DIT_FUSEQK")
++_geak_qkrope_cache = {}
++_GEAK_QKROPE_STAGES = 2 if _geak_flag("GEAK_DIT_LNCFG") else 1
++
++# ---------------------------------------------------------------------------
++# ROUND 5 -- GEAK_DIT_QNORM: the CROSS-attention query RMS-norm, one triton
++# kernel over whole token rows instead of one CTA per 128-element head.
++#
++# MEASURED (this box, torch.profiler, real shape [1,392,16,128] bf16):
++#   torch F.rms_norm  -> vectorized_layer_norm_kernel<BFloat16,float,true>
++#                        6272 CTAs (one per HEAD row of 128 elements = 256 B)
++#                        6.65 us for 3.2 MB of traffic = 482 GB/s, ~9x off the
++#                        HBM roofline.  The kernel is not slow, the DECOMPOSITION
++#                        is: a 256-byte row cannot amortise a CTA.
++#   triton, one program per TOKEN (392 CTAs x [16,128] tile, 4 KB/row, the 16
++#   per-head reductions done independently inside the tile) -> 2.02 us.
++# = -4.6 us x 18 blocks = -83 us/iter of pure body, at the SAME node count, so
++# it is immune to the "eager triton launch tax" argument only insofar as it
++# replaces a torch op 1:1 (5.9 us direct-launch host vs ~4-5 us for the aten
++# call) -- the device saving is 4.6 us, an order above that difference.
++#
++# NUMERICS: identical to `vectorized_layer_norm_kernel<BFloat16,float,true>` --
++# fp32 accumulation of sum(x*x), one fp32 rsqrt, gain applied in fp32, ONE
++# rounding to bf16 at the store.  Only the 128-element reduction ORDER differs.
++# ---------------------------------------------------------------------------
++_GEAK_QNORM = _geak_flag("GEAK_DIT_QNORM")
++_geak_qnorm_cache = {}
++
++if _GEAK_TRITON_OK:
++
++    @_geak_triton.jit
++    def _geak_qnorm_kernel(
++        X, W, O, eps,
++        H: _geak_tl.constexpr, D: _geak_tl.constexpr,
++    ):
++        row = _geak_tl.program_id(0)
++        h = _geak_tl.arange(0, H)
++        d = _geak_tl.arange(0, D)
++        off = h[:, None] * D + d[None, :]
++        x = _geak_tl.load(X + row * H * D + off).to(_geak_tl.float32)
++        inv = _geak_tl.rsqrt(_geak_tl.sum(x * x, 1) / D + eps)[:, None]
++        g = _geak_tl.load(W + d)[None, :].to(_geak_tl.float32)
++        _geak_tl.store(O + row * H * D + off, (x * inv * g).to(O.dtype.element_ty))
++
++
++_GEAK_QNORM_WARPS = int(_geak_os.environ.get("GEAK_DIT_QNORM_WARPS", "4"))
++
++
++def _geak_qnorm(x4, w, eps):
++    """RMS-norm over the last dim of a contiguous [B, S, H, D] tensor, affine
++    gain `w` of shape [D].  Returns a contiguous [B, S, H, D]."""
++    B, S, H, D = x4.shape
++    n = B * S
++    o = torch.empty_like(x4)
++    args = (x4, w, o, float(eps))
++    key = (n, H, D, x4.dtype)
++    if _GEAK_FUSELN_FAST:
++        if key not in _geak_qnorm_cache:
++            ck = None
++            try:
++                kk = _geak_qnorm_kernel[(n,)](*args, H=H, D=D,
++                                              num_warps=_GEAK_QNORM_WARPS, num_stages=1)
++                if kk is not None and hasattr(kk, "run") and hasattr(kk, "__getitem__"):
++                    ck = kk
++            except Exception:
++                ck = None
++            _geak_qnorm_cache[key] = ck
++        ck = _geak_qnorm_cache[key]
++        if ck is not None:
++            ck[(n, 1, 1)](*args)
++            return o
++    _geak_qnorm_kernel[(n,)](*args, H=H, D=D,
++                             num_warps=_GEAK_QNORM_WARPS, num_stages=1)
++    return o
++
++
++def _geak_qnorm_ok(x, w) -> bool:
++    if not (_GEAK_QNORM and _GEAK_TRITON_OK):
++        return False
++    if x.ndim != 4 or not x.is_cuda or not x.is_contiguous():
++        return False
++    H, D = x.shape[2], x.shape[3]
++    if H & (H - 1) or D & (D - 1) or D < 16 or D > 256:
++        return False
++    return w is not None and w.dtype == x.dtype and w.is_contiguous() and w.shape == (D,)
++
++
++# ---------------------------------------------------------------------------
++# CAMPAIGN 2 ROUND 1 -- GEAK_DIT_CAFUSE: the cross-attention query RMS-norm is
++# folded INTO a triton flash-attention kernel, deleting a whole device node per
++# block from the 4.32 ms region that both scored cases share.
++#
++# WHY THIS AND NOT THE OTHER CANDIDATES (all measured on this box, device time
++# taken from HIP-graph replay so the triton python launcher is not in the
++# number; the isolated in-graph NODE FLOOR here is 1.79 us):
++#
++#   * The 18-block chain is STRICTLY SERIAL.  self-out-proj -> add+LN -> cross
++#     q-proj -> cross-out-proj are each other's inputs, so the three per-block
++#     [392,2048]x[2048,2048] GEMMs CANNOT be column-concatenated.  Measured
++#     F.linear 11.28 us vs mm(NN, pre-transposed B) 12.24 us -- and TunableOp's
++#     own sweep returns 11.47 us, i.e. the library has nothing better.  Same for
++#     QKV (20.05 / 21.86 / 20.47), FF-up (26.31 addmm_activation / 25.85 / 25.11)
++#     and FF-down (27.04 / 27.20 / 28.90).  The vendor GEMM lane is CLOSED and
++#     the PostGSU8 split-K reduction does not dissolve under any layout I could
++#     hand it, because M=392 is what starves the tiling, not the operand order.
++#   * aiter's fmha is NOT beatable here either: a hand-written triton flash
++#     attention swept over 72 (BLOCK_M, BLOCK_N, warps, stages) points lands at
++#     13.23 us against aiter's 13.73 us (self, S=392) and 13.74 vs 14.29 (cross,
++#     S_kv=512) -- inside noise.  The kernel is latency bound, not underfilled:
++#     the SAME call at batch 8 costs 22.4 us, i.e. 8x the work for 1.5x the time.
++#   * The fused add+LN+modulate kernel is already at 2.87 us against a 1.79 us
++#     floor for 6.4 MB of traffic; single-pass (E[x],E[x^2]) reduction, mask
++#     removal and multi-row programs were all measured and none beat it.
++#
++# What DOES pay is deleting a node.  The cross-attention query norm is a pure
++# per-row transform of the q tile that the attention kernel already loads, so
++# folding it in costs nothing and removes both the kernel AND its 3.2 MB
++# round-trip through HBM:
++#     _geak_qnorm_kernel + aiter::fmha   16.29 us   (2 nodes)
++#     _geak_cafa_kernel                  13.07 us   (1 node)
++# = -3.2 us and -1 node per block, x18 blocks, entirely inside the shared region.
++#
++# NUMERICS: the q transform is byte-for-byte `_geak_qnorm_kernel`'s (fp32
++# accumulation of sum(x*x) over D, one fp32 rsqrt, gain applied in fp32, one
++# rounding to bf16).  The attention itself is textbook online-softmax flash with
++# an fp32 accumulator and exp2; measured max|d| vs aiter on the real shape is
++# 3.9e-3 on unit-variance inputs, i.e. one bf16 ulp.
++#
++# Kill switch: GEAK_DIT_CAFUSE=0 restores `_geak_qnorm` + SDPA exactly.
++# ---------------------------------------------------------------------------
++_GEAK_CAFUSE = _geak_flag("GEAK_DIT_CAFUSE")
++_GEAK_CAFA_BM = int(_geak_os.environ.get("GEAK_DIT_CAFA_BM", "32"))
++_GEAK_CAFA_BN = int(_geak_os.environ.get("GEAK_DIT_CAFA_BN", "128"))
++_GEAK_CAFA_WARPS = int(_geak_os.environ.get("GEAK_DIT_CAFA_WARPS", "4"))
++_GEAK_CAFA_STAGES = int(_geak_os.environ.get("GEAK_DIT_CAFA_STAGES", "2"))
++# ---------------------------------------------------------------------------
++# CAMPAIGN 2 ROUND 4 -- GEAK_DIT_CARCP: the same INSTRUCTION lane round 3 opened
++# on the two fp8 quantisers, applied to the largest triton kernel this file owns.
++#
++# `_geak_cafa_kernel` is 0.279 ms x 18 nodes in the profiler, more than either
++# quantiser, and two of its instruction costs are pure waste:
++#
++# (1) THE EPILOGUE DIVIDE.  `acc / l_i[:, None]` is a per-ELEMENT IEEE fp32
++#     division over a [BM, D] = [32, 128] accumulator -- 4096 divide expansions
++#     per program to apply 32 distinct row scales.  One reciprocal per ROW and a
++#     multiply is 32 divides + 4096 v_mul.  Exactly the round-3 lever.
++# (2) THE DEAD KV MASK.  The K/V loop is `for n0 in range(0, SKV, BN)` and the
++#     deployed shape has SKV = 512, BN = 128 -- FOUR whole iterations, never a
++#     partial one.  But `SKV` is a RUNTIME argument, so the compiler cannot
++#     prove it and emits, every iteration, a masked K load, a masked V load and
++#     a [BM, BN] = 4096-element `where(nm, qk, -inf)` select.  Hoisting
++#     `SKV % BN == 0` to a host-side constexpr deletes all of it.  (The M side
++#     is NOT even -- SQ = 392, BM = 32 -- so that mask stays.)
++#
++# MEASURED, real shapes [1,392,16,128] q / [1,16,512,128] kv, HIP-graph replay,
++# 25 timed replays of a 50-launch graph:
++#     shipped (divide + runtime KV mask)      13.458 us   1587 v_* , 80 mfma
++#     + reciprocal epilogue                   13.188 us   1430 v_*
++#     + EVEN_N (both, shipped)                12.553 us   1226 v_*   <- 1.072x
++#     + qk_scale folded into the exp2 FMA     12.565 us   1112 v_*   (tie, not shipped)
++#     + qk_scale folded into the rms gain     12.490 us   1106 v_*   (rejected:
++#        doubles err vs an fp64 reference, 1.29e-3 -> 2.66e-3, for 0.06 us)
++# The kernel stops being VALU-bound below ~1200 instructions, which is why the
++# last two rows buy nothing -- 1226 is the knee, and this lever reaches it.
++#
++# NUMERICS.  Error against an fp64 SDPA reference on the real shape is
++# 1.286e-03 for the shipped kernel and 1.286e-03 for this one -- IDENTICAL, to
++# every digit.  The two outputs differ from each other by 9.77e-04, which is
++# half a bf16 ulp at the output magnitude (bf16 ulp at 0.5 is 1.95e-03): the
++# reciprocal moves the rounding, it does not add error.  Removing a mask that
++# was never false cannot change a value at all.
++#
++# Kill switch: GEAK_DIT_CARCP=0 restores the divide AND the runtime KV mask,
++# both as compile-time constexpr, so the OFF arm is the round-3 kernel
++# instruction for instruction rather than a runtime branch.
++# ---------------------------------------------------------------------------
++_GEAK_CARCP = _geak_flag("GEAK_DIT_CARCP")
++_geak_cafa_cache = {}
++_geak_cafa_seen = [0]
++
++if _GEAK_TRITON_OK:
++
++    @_geak_triton.jit
++    def _geak_cafa_kernel(
++        XQ, W, K, V, O, SCL,
++        sqb, sqs, sqh, skb, sks, skh, svb, svs, svh, sob, sos, soh,
++        eps, qk_scale, SQ, SKV,
++        RCP: _geak_tl.constexpr, EVEN_N: _geak_tl.constexpr,
++        Q8: _geak_tl.constexpr, FMAX: _geak_tl.constexpr,
++        H: _geak_tl.constexpr, D: _geak_tl.constexpr,
++        BM: _geak_tl.constexpr, BN: _geak_tl.constexpr,
++    ):
++        pm = _geak_tl.program_id(0)
++        bh = _geak_tl.program_id(1)
++        b = bh // H
++        h = bh % H
++        d = _geak_tl.arange(0, D)
++        g = _geak_tl.load(W + d)[None, :].to(_geak_tl.float32)
++        offm = pm * BM + _geak_tl.arange(0, BM)
++        mm = offm < SQ
++        x = _geak_tl.load(XQ + b * sqb + h * sqh + offm[:, None] * sqs + d[None, :],
++                          mask=mm[:, None], other=0.0).to(_geak_tl.float32)
++        inv = _geak_tl.rsqrt(_geak_tl.sum(x * x, 1) / D + eps)[:, None]
++        q = (x * inv * g).to(XQ.dtype.element_ty)
++        m_i = _geak_tl.full([BM], -float('inf'), _geak_tl.float32)
++        l_i = _geak_tl.zeros([BM], _geak_tl.float32)
++        acc = _geak_tl.zeros([BM, D], _geak_tl.float32)
++        kb = K + b * skb + h * skh
++        vb = V + b * svb + h * svh
++        for n0 in range(0, SKV, BN):
++            offn = n0 + _geak_tl.arange(0, BN)
++            if EVEN_N:
++                # SKV % BN == 0 proved on the host: no K/V mask, no -inf select
++                kk = _geak_tl.load(kb + offn[:, None] * sks + d[None, :])
++                qk = _geak_tl.dot(q, _geak_tl.trans(kk)) * qk_scale
++            else:
++                nm = offn < SKV
++                kk = _geak_tl.load(kb + offn[:, None] * sks + d[None, :],
++                                   mask=nm[:, None], other=0.0)
++                qk = _geak_tl.dot(q, _geak_tl.trans(kk)) * qk_scale
++                qk = _geak_tl.where(nm[None, :], qk, -float('inf'))
++            mn = _geak_tl.maximum(m_i, _geak_tl.max(qk, 1))
++            al = _geak_tl.math.exp2(m_i - mn)
++            p = _geak_tl.math.exp2(qk - mn[:, None])
++            l_i = l_i * al + _geak_tl.sum(p, 1)
++            acc = acc * al[:, None]
++            if EVEN_N:
++                v = _geak_tl.load(vb + offn[:, None] * svs + d[None, :])
++            else:
++                v = _geak_tl.load(vb + offn[:, None] * svs + d[None, :],
++                                  mask=(offn < SKV)[:, None], other=0.0)
++            acc = _geak_tl.dot(p.to(v.dtype), v, acc)
++            m_i = mn
++        if Q8:
++            # GEAK_DIT_OPROJ8: STATIC per-tensor activation scale, resolved once
++            # per prompt on the host and read from a 1-element device scalar, so
++            # the epilogue emits OCP e4m3 with NO reduction and NO extra node.
++            # `rs` is folded into the same reciprocal the RCP lever already
++            # computes, so the fp8 arm costs the SAME [BM,D] multiply the bf16
++            # arm costs -- the only added instructions are the two clamps.
++            rs = _geak_tl.load(SCL)
++            if RCP:
++                acc = acc * (rs / l_i)[:, None]
++            else:
++                acc = (acc / l_i[:, None]) * rs
++            acc = _geak_tl.minimum(_geak_tl.maximum(acc, -FMAX), FMAX)
++        elif RCP:
++            # one reciprocal per ROW instead of one fp32 divide per ELEMENT
++            acc = acc * (1.0 / l_i)[:, None]
++        else:
++            acc = acc / l_i[:, None]
++        _geak_tl.store(O + b * sob + h * soh + offm[:, None] * sos + d[None, :],
++                       acc.to(O.dtype.element_ty), mask=mm[:, None])
++
++
++def _geak_cafa_ok(q4, w, k4, v4) -> bool:
++    """q4: [B, S, H, D] contiguous (raw to_q output).  k4/v4: [B, H, Skv, D]
++    views whose last dim is contiguous."""
++    if not (_GEAK_CAFUSE and _GEAK_TRITON_OK):
++        return False
++    if q4.ndim != 4 or not q4.is_cuda or not q4.is_contiguous():
++        return False
++    B, S, H, D = q4.shape
++    if D & (D - 1) or D < 16 or D > 256 or S <= 0:
++        return False
++    if w is None or w.dtype != q4.dtype or not w.is_contiguous() or w.shape != (D,):
++        return False
++    for t in (k4, v4):
++        if t.ndim != 4 or t.dtype != q4.dtype or t.stride(3) != 1:
++            return False
++        if t.shape[0] != B or t.shape[1] != H or t.shape[3] != D:
++            return False
++    if k4.shape[2] != v4.shape[2]:
++        return False
++    return True
++
++
++def _geak_cross_fa(q4, w, eps, k4, v4, q8=None):
++    """Fused cross-attention: RMS-norm(q4) -> flash attention against the cached
++    k4/v4.  Returns a contiguous [B, S, H*D] tensor, or None if ineligible.
++
++    `q8`, when given, is `(rcp, scale_a)` from `_geak_oproj8_scale`: the epilogue
++    then emits OCP e4m3 pre-divided by the static scale instead of bf16."""
++    B, S, H, D = q4.shape
++    SKV = k4.shape[2]
++    if q8 is None:
++        o = torch.empty((B, S, H, D), device=q4.device, dtype=q4.dtype)
++        scl = _geak_scl_dummy(q4.device)
++    else:
++        o = torch.empty((B, S, H, D), device=q4.device, dtype=_GEAK_F8)
++        scl = q8[0]
++    scale = float(D ** -0.5) * 1.4426950408889634
++    args = (q4, w, k4, v4, o, scl,
++            q4.stride(0), q4.stride(1), q4.stride(2),
++            k4.stride(0), k4.stride(2), k4.stride(1),
++            v4.stride(0), v4.stride(2), v4.stride(1),
++            o.stride(0), o.stride(1), o.stride(2),
++            float(eps), scale, S, SKV)
++    BM = _GEAK_CAFA_BM
++    grid = ((S + BM - 1) // BM, B * H, 1)
++    # `SKV % BN == 0` is a HOST fact the kernel cannot prove -- hoist it.
++    even_n = bool(_GEAK_CARCP) and (SKV % _GEAK_CAFA_BN == 0)
++    q8f = q8 is not None
++    key = (S, SKV, H, D, B, q4.dtype, _GEAK_CARCP, even_n, q8f)
++    if _GEAK_FUSELN_FAST:
++        if key not in _geak_cafa_cache:
++            ck = None
++            try:
++                kk = _geak_cafa_kernel[grid](
++                    *args, RCP=_GEAK_CARCP, EVEN_N=even_n,
++                    Q8=q8f, FMAX=_GEAK_F8MAX,
++                    H=H, D=D, BM=BM, BN=_GEAK_CAFA_BN,
++                    num_warps=_GEAK_CAFA_WARPS, num_stages=_GEAK_CAFA_STAGES)
++                if kk is not None and hasattr(kk, "run") and hasattr(kk, "__getitem__"):
++                    ck = kk
++            except Exception:
++                ck = None
++            _geak_cafa_cache[key] = ck
++        ck = _geak_cafa_cache[key]
++        if ck is not None:
++            ck[grid](*args)
++            return o.view(B, S, H * D)
++    _geak_cafa_kernel[grid](
++        *args, RCP=_GEAK_CARCP, EVEN_N=even_n,
++        Q8=q8f, FMAX=_GEAK_F8MAX,
++        H=H, D=D, BM=BM, BN=_GEAK_CAFA_BN,
++        num_warps=_GEAK_CAFA_WARPS, num_stages=_GEAK_CAFA_STAGES)
++    return o.view(B, S, H * D)
++
++
++# ---------------------------------------------------------------------------
++# CAMPAIGN 3 ROUND 1 -- GEAK_DIT_OPROJ8: ATTENTION-EPILOGUE OWNERSHIP.
++# The cross-attention out-projection ([392,2048]x[2048,2048]) runs in fp8 e4m3
++# with NO extra dispatch and NO runtime reduction.
++#
++# WHY THIS IS NOT THE CLOSURE CAMPAIGN 2 RECORDED.  Round 2 left the two
++# out-projections in bf16 with the note "their activation is an attention
++# output, not an add+LN output, so it would need its OWN quant node: 2.60 us of
++# rowwise quant against a 2.33 us GEMM saving".  Every one of the three
++# closures on record was about the QUANTISER, never about the GEMM:
++#   (a) ROWWISE needs an amax over the whole 2048-wide row, but the attention
++#       kernel is parallel over HEADS -- one program owns only D=128 of that row.
++#   (b) A STANDALONE quant node costs more than the GEMM saves.
++#   (c) 1x128 block granularity is refused by torch._scaled_mm and MXFP8 1x32
++#       measured slower than bf16 on every Cosmos shape.
++# A STATIC PER-TENSOR activation scale defeats all three at once: each program
++# quantises the tile it already holds in registers, with a scalar it reads from
++# a 1-element device tensor.  No reduction, no extra node, no per-head conflict.
++#
++# WHERE THE SCALE COMES FROM -- a BOUND, not a calibration.  The attention
++# output is a CONVEX COMBINATION of the V rows (softmax weights are >=0 and sum
++# to 1), so for every row m and channel c
++#       |out[m, c]| = |sum_j p[m, j] V[j, c]|  <=  max_j |V[j, c]|  <=  amax(V).
++# On the cross-attention path V is the CACHED, prompt-derived value tensor
++# (GEAK_DIT_TXTCACHE), so `amax(V)` is an instruction-invariant constant that is
++# computed ONCE per prompt, on an eager call, outside any graph capture, and
++# pinned on the module for the captured graph's lifetime.  It is therefore a
++# baked constant on the timed path -- and, unlike a calibrated constant, it is a
++# PROVABLE upper bound: this quantiser can never clip, on any frame, ever.
++#
++# WHY A LOOSE BOUND IS FREE IN e4m3 (and would NOT be in int8).  e4m3 is a
++# FLOATING-point format: 4 exponent bits, 3 mantissa bits, so its ~3.1% relative
++# grain is the same for every value in [2^-6, 448] of the scaled domain -- a
++# 2^14.8 dynamic range.  A scale that is R times looser than the true amax only
++# moves the subnormal knee from max/28672 to R*max/28672; it does not coarsen a
++# single value that matters.  The measured looseness on the deployed shapes is
++# recorded by GEAK_DIT_OPROJ8_ECHO=1 (amax(V) vs the realised |out| amax).
++#
++# COST ACCOUNTING (this box, HIP-graph replay, M=392 K=2048 N=2048, medians):
++#     bf16 F.linear                        10.12 us
++#     _scaled_mm rowwise x rowwise          7.69 us
++#     _scaled_mm const scale_a x rowwise    7.64 us   <- shipped
++#     _scaled_mm per-tensor x per-tensor    7.39 us   (needs a scalar WEIGHT
++#                                                      scale; not taken)
++# = -2.48 us x 18 blocks, plus the cafa epilogue storing HALF the bytes
++# (0.8 MB instead of 1.6 MB per block).  Node count is FLAT: 36 -> 36.
++# `scale_a` is a [M,1] fp32 constant built with the scale, so the GEMM takes the
++# rowwise (PTPC) path the rest of this file already uses and the WEIGHT keeps its
++# per-output-channel scale -- the accurate granularity is preserved on the side
++# that can afford it.
++#
++# Kill switch: GEAK_DIT_OPROJ8=0 restores the bf16 epilogue and F.linear exactly
++# (Q8 is a compile-time constexpr, so the OFF arm is the round-4 kernel
++# instruction for instruction, not a runtime branch).
++# GEAK_DIT_OPROJ8_ECHO=1 prints liveness + the realised quantisation margin.
++# ---------------------------------------------------------------------------
++_GEAK_OPROJ8 = _geak_flag("GEAK_DIT_OPROJ8")
++_GEAK_OPROJ8_ECHO = _geak_flag("GEAK_DIT_OPROJ8_ECHO", "0")
++# Extra multiplicative headroom on the (already rigorous) bound.  1.0 is exact;
++# raising it only wastes e4m3 exponent range, lowering it below 1.0 would make
++# the bound non-rigorous and is refused.
++_GEAK_OPROJ8_HEAD = max(1.0, float(_geak_os.environ.get("GEAK_DIT_OPROJ8_HEAD", "1.0")))
++_geak_oproj8_seen = [0]
++_geak_scl_dummies = {}
++
++
++def _geak_scl_dummy(device):
++    """A 1-element fp32 device tensor for the OFF arm's (never-executed) SCL
++    pointer argument.  Allocated once per device, never read."""
++    d = _geak_scl_dummies.get(device)
++    if d is None:
++        d = torch.zeros(1, device=device, dtype=torch.float32)
++        _geak_scl_dummies[device] = d
++    return d
++
++
++def _geak_oproj8_plan(attn, v4, n):
++    """(rcp[1] fp32, scale_a[n,1] fp32, (mat2, wscale)) for this module's cross
++    out-projection, or None.  Cached on the module and keyed on the IDENTITY of
++    the cached V tensor -- V is a pure function of the prompt, so the key is
++    instruction-invariant (never frame-derived) and the entry holds a strong
++    reference so it can neither be recycled nor freed under a captured graph."""
++    if not (_GEAK_OPROJ8 and _GEAK_FASTFN and _GEAK_F8 is not None):
++        return None
++    c = getattr(attn, "_geak_o8", None)
++    if c is not None and c[0] is v4 and c[1] == n:
++        return c[2]
++    try:
++        if torch.cuda.is_current_stream_capturing():
++            return None            # never build a scale inside a capture
++    except Exception:
++        pass
++    plan = None
++    try:
++        p = _geak_out_params(attn)
++        if p is not False and p[1] is None:
++            wp = _geak_fp8_w(attn, "_geak_f8o", p[0])
++            if wp:
++                amax = v4.detach().float().abs().amax().clamp(min=1e-12)
++                amax = amax * _GEAK_OPROJ8_HEAD
++                sa = (amax / _GEAK_F8MAX).reshape(1, 1).expand(n, 1).contiguous()
++                rcp = (_GEAK_F8MAX / amax).reshape(1).contiguous()
++                plan = (rcp, sa, wp)
++    except Exception:
++        plan = None
++    attn._geak_o8 = (v4, n, plan)
++    if plan is not None and _geak_oproj8_seen[0] == 0:
++        _geak_oproj8_seen[0] = 1
++        if _GEAK_VERIFY or _GEAK_OPROJ8_ECHO:
++            print("[geak] OPROJ8 LIVE: v=%s n=%d amax(V)=%.4f scale_a=%.6g"
++                  % (tuple(v4.shape), n, float(v4.detach().float().abs().amax()),
++                     float(plan[1][0, 0])), flush=True)
++    return plan
++
++
++def _geak_cross_attn_fused(attn, q4, k4, v4):
++    """Full cross-attention tail on the fused path, or None when ineligible."""
++    nq = attn.norm_q
++    if not (_GEAK_NORMPRE and getattr(nq, "bias", None) is None
++            and getattr(nq, "elementwise_affine", False) and hasattr(nq, "dim")):
++        return None
++    w = getattr(nq, "weight", None)
++    dim = tuple(nq.dim)
++    if len(dim) != 1 or dim[0] != q4.shape[3]:
++        return None
++    if not _geak_cafa_ok(q4, w, k4, v4):
++        return None
++    q8 = _geak_oproj8_plan(attn, v4, q4.shape[0] * q4.shape[1])
++    h = _geak_cross_fa(q4, w, float(nq.eps), k4, v4, q8)
++    if h is None:
++        return None
++    if q8 is not None:
++        n = q4.shape[0] * q4.shape[1]
++        o = _geak_f8mm(h.view(n, -1), q8[1], q8[2])
++        return o.view(q4.shape[0], q4.shape[1], -1)
++    if _geak_cafa_seen[0] == 0:
++        _geak_cafa_seen[0] = 1
++        if _GEAK_VERIFY or _geak_flag("GEAK_DIT_CAFUSE_ECHO", "0"):
++            print("[geak] CAFUSE LIVE: q=%s kv=%s grid=%d x %d" %
++                  (tuple(q4.shape), tuple(k4.shape),
++                   (q4.shape[1] + _GEAK_CAFA_BM - 1) // _GEAK_CAFA_BM,
++                   q4.shape[0] * q4.shape[2]), flush=True)
++    if _GEAK_FASTFN:
++        p = _geak_out_params(attn)
++        if p is not False:
++            return F.linear(h, p[0], p[1])
++    return attn.to_out[1](attn.to_out[0](h))
++
++# ---------------------------------------------------------------------------
++# ROUND 5 -- GEAK_DIT_FFGELU: the FeedForward up-projection carries its own GELU
++# in the GEMM epilogue (hipBLASLt GELU epilogue via aten::_addmm_activation)
++# instead of dispatching GeluCUDAKernelImpl over the [392, 8192] intermediate.
++#
++# MEASURED (this box, real shapes, bf16):
++#   F.gelu(F.linear(x, w1))          27.22 us (GEMM) + 6.05 us (Gelu) = 33.27 us
++#   torch._addmm_activation(...gelu) 26.77 us total, ONE dispatch
++# = -6.5 us of device AND -1 node (-1.78 us of in-graph floor) x 18 blocks
++# = ~-0.12 ms/iter.  The epilogue is applied in the fp32 accumulator before the
++# store, so the [392, 8192] intermediate is never re-read from HBM.
++#
++# NUMERICS: hipBLASLt's GELU epilogue is the tanh approximation, torch's default
++# is erf.  Measured on the real shape the two differ by 0.03125 = exactly ONE
++# bf16 ulp at the magnitude where the gap peaks (|x|~2), i.e. the approximation
++# error is BELOW the storage precision of the tensor it lands in.
++# ---------------------------------------------------------------------------
++_GEAK_FFGELU = _geak_flag("GEAK_DIT_FFGELU")
++
++# ---------------------------------------------------------------------------
++# ROUND 5 -- GEAK_DIT_TUNABLE: let hipBLASLt pick the GEMM kernel by MEASUREMENT
++# instead of by heuristic, for the block loop's four distinct shapes.
++#
++# WHY (the arithmetic that made this the biggest lever left in region C).  The
++# block GEMMs are not FLOP bound and they are not HBM bound -- they are bound by
++# the number of times the WEIGHT matrix is re-read, which is exactly the number
++# of M tiles.  M is 392 (2 frames x 196 tokens), so a macro-tile of MT_M=64 reads
++# every weight SEVEN times and MT_M=128 reads it four times: per block the six
++# GEMMs hold 117 MB of weights, so the M-tile choice is worth hundreds of MB of
++# L2/HBM traffic per block.  hipBLASLt's heuristic picks MT64x224 for the FF up
++# projection and MT64x64 for the three 2048x2048 projections -- both MT_M=64.
++#
++# MEASURED, this box, real shapes, bf16 (torch.profiler, 40 reps, hot):
++#     [392,2048]x[2048,2048]   heuristic MT64x64x256   12.15 us
++#                              tuned     MT64x64x128    9.41 us   (-23%)
++#     [392,2048]x[2048,8192]   heuristic MT64x224x128  27.2  us
++#     + fused GELU epilogue    tuned     MT128x128x..  21.05 us   (-23%)
++#     [392,2048]x[2048,6144]   16.68 -> 16.09 us
++#     [392,8192]x[8192,2048]   25.24 -> 25.11 us  (split-K reduction dominates)
++# 54 + 18 launches of the first two per forward = ~-0.37 ms of pure GEMM time.
++#
++# Tuning runs ONCE per shape on first sight, inside the harness's 25 untimed
++# warmups, and is skipped by torch while a stream is capturing (so r3_d0's
++# backbone graph is unaffected).  Results are cached in-process and mirrored to
++# a /tmp CSV so a re-launched process does not re-tune.
++# ---------------------------------------------------------------------------
++# SHIPPED OFF -- MEASURED, and the measurement is the point (see the note above
++# the switch).  Region-C-scoped tuning is worth ~0 because hipBLASLt's heuristic
++# is already at the cold optimum for these four shapes: TunableOp's own COLD
++# (rotating-buffer) sweep found 12.18 us for [392,2048]x[2048,2048] against a
++# 12.15 us heuristic default, i.e. nothing better exists in the library.  The
++# 23% "win" an isolated sweep shows for that shape is the round-4 hot-L2 trap --
++# one weight matrix reused across launches is permanently L2-resident and the
++# ranking inverts.  Tuning the WHOLE process (GEAK_DIT_TUNABLE_SCOPE=all) IS
++# worth 5.800 -> 5.575 ms of geomean, but every microsecond of that comes from
++# the Qwen VLM GEMMs (tn_3584_512_3584 / tn_18944_512_3584), i.e. another lane's
++# region, and it costs ~9 MINUTES of tuning per process (347 s even capped at
++# 1 ms x 5 iters per solution, which also degrades the pick to 5.723).  Recorded
++# for the TechLead; not shipped from this lane.
++_GEAK_TUNABLE = _geak_flag("GEAK_DIT_TUNABLE", "0")
++
++
++# Tuning is expensive (one measured sweep per SHAPE) and it must not run while a
++# stream is capturing, so it is switched on ONLY around the region-C block loop
++# and ONLY for the first few calls -- which land inside the harness's untimed
++# warmups.  Lookup stays on globally (a hash probe per GEMM, no measurement); an
++# untuned shape simply falls through to hipBLASLt's own heuristic, so nothing
++# outside this lane changes behaviour.
++_GEAK_TUNABLE_CALLS = int(_geak_os.environ.get("GEAK_DIT_TUNABLE_CALLS", "4"))
++_GEAK_TUNABLE_SCOPE = _geak_os.environ.get("GEAK_DIT_TUNABLE_SCOPE", "block")
++_geak_tun_budget = [_GEAK_TUNABLE_CALLS if _GEAK_TUNABLE else 0]
++
++
++def _geak_enable_tunable():
++    if not _GEAK_TUNABLE:
++        return
++    try:
++        t = torch.cuda.tunable
++        if t.is_enabled():
++            return
++        t.set_filename(_geak_os.environ.get(
++            "GEAK_DIT_TUNABLE_FILE",
++            "/tmp/geak_dit_c_tunable_%d.csv"), True)
++        t.set_max_tuning_duration(
++            int(_geak_os.environ.get("GEAK_DIT_TUNABLE_MS", "30")))
++        try:
++            t.set_max_tuning_iterations(
++                int(_geak_os.environ.get("GEAK_DIT_TUNABLE_ITERS", "100")))
++        except Exception:
++            pass
++        t.enable(True)
++        t.tuning_enable(_GEAK_TUNABLE_SCOPE == "all")
++    except Exception:
++        pass
++
++
++_geak_enable_tunable()
++
++
++def _geak_tun_begin() -> bool:
++    if _geak_tun_budget[0] <= 0 or _GEAK_TUNABLE_SCOPE != "block":
++        return False
++    try:
++        if torch.cuda.is_current_stream_capturing():
++            return False
++        torch.cuda.tunable.tuning_enable(True)
++        return True
++    except Exception:
++        return False
++
++
++def _geak_tun_end():
++    try:
++        torch.cuda.tunable.tuning_enable(False)
++    except Exception:
++        pass
++    _geak_tun_budget[0] -= 1
++
++
++
++if _GEAK_TRITON_OK:
++
++    @_geak_triton.jit
++    def _geak_qkrope_kernel(
++        T, W, COS, SIN, Q, K, eps,
++        H: _geak_tl.constexpr, D: _geak_tl.constexpr, HD: _geak_tl.constexpr,
++    ):
++        row = _geak_tl.program_id(0)
++        h = _geak_tl.arange(0, H)
++        d = _geak_tl.arange(0, D)
++        off = h[:, None] * D + d[None, :]
++        dr = (d + D // 2) % D
++        offr = h[:, None] * D + dr[None, :]
++        neg = d < (D // 2)
++
++        cs = _geak_tl.load(COS + row * D + d)[None, :]
++        sn = _geak_tl.load(SIN + row * D + d)[None, :]
++        base = row * 3 * HD
++
++        for j in _geak_tl.static_range(2):
++            x = _geak_tl.load(T + base + j * HD + off).to(_geak_tl.float32)
++            xr = _geak_tl.load(T + base + j * HD + offr).to(_geak_tl.float32)
++            inv = _geak_tl.rsqrt(_geak_tl.sum(x * x, 1) / D + eps)[:, None]
++            g = _geak_tl.load(W + j * D + d)[None, :].to(_geak_tl.float32)
++            gr = _geak_tl.load(W + j * D + dr)[None, :].to(_geak_tl.float32)
++            a = ((x * inv).to(Q.dtype.element_ty).to(_geak_tl.float32) * g).to(Q.dtype.element_ty)
++            b = ((xr * inv).to(Q.dtype.element_ty).to(_geak_tl.float32) * gr).to(Q.dtype.element_ty)
++            bf = _geak_tl.where(neg[None, :], -b.to(_geak_tl.float32), b.to(_geak_tl.float32))
++            o = (a.to(_geak_tl.float32) * cs + bf * sn).to(Q.dtype.element_ty)
++            if j == 0:
++                _geak_tl.store(Q + row * HD + off, o)
++            else:
++                _geak_tl.store(K + row * HD + off, o)
++
++
++def _geak_qkrope(t5, wqk, cos, sin, eps, warps=4):
++    """t5: [B, S, 3, H, D] contiguous.  wqk: [2,1,1,1,D].  cos/sin: [S, D] fp32.
++    Returns contiguous q, k of shape [B, S, H, D]."""
++    B, S, _, H, D = t5.shape
++    n = B * S
++    q = torch.empty((B, S, H, D), device=t5.device, dtype=t5.dtype)
++    k = torch.empty((B, S, H, D), device=t5.device, dtype=t5.dtype)
++    args = (t5, wqk, cos, sin, q, k, float(eps))
++    key = (n, H, D, t5.dtype)
++    if _GEAK_FUSELN_FAST:
++        if key not in _geak_qkrope_cache:
++            ck = None
++            try:
++                kk = _geak_qkrope_kernel[(n,)](*args, H=H, D=D, HD=H * D,
++                                              num_warps=warps,
++                                              num_stages=_GEAK_QKROPE_STAGES)
++                if kk is not None and hasattr(kk, "run") and hasattr(kk, "__getitem__"):
++                    ck = kk
++            except Exception:
++                ck = None
++            _geak_qkrope_cache[key] = ck
++        ck = _geak_qkrope_cache[key]
++        if ck is not None:
++            ck[(n, 1, 1)](*args)
++            return q, k
++    _geak_qkrope_kernel[(n,)](*args, H=H, D=D, HD=H * D,
++                              num_warps=warps, num_stages=_GEAK_QKROPE_STAGES)
++    return q, k
++
++
++
++def _geak_addln_compiled(key, args, grid, nw):
++    """Return a direct launcher for the already-compiled kernel, or None."""
++    if key in _geak_addln_cache:
++        return _geak_addln_cache[key]
++    ck = None
++    try:
++        k = _geak_addln_kernel[grid](*args, C=key[1], BLOCK=key[1],
++                                     num_warps=nw, num_stages=_GEAK_FUSELN_STAGES)
++        if k is not None and hasattr(k, "run") and hasattr(k, "__getitem__"):
++            ck = k
++    except Exception:
++        ck = None
++    _geak_addln_cache[key] = ck
++    return ck
++
++
++def _geak_fuseln_ok(x4, gate, shift, scale) -> bool:
++    if not (_GEAK_FUSELN and _GEAK_TRITON_OK):
++        return False
++    if not x4.is_cuda or not x4.is_contiguous() or x4.ndim != 4:
++        return False
++    B, T, S, C = x4.shape
++    if C & (C - 1):                       # kernel assumes BLOCK == C, a power of two
++        return False
++    for t in (gate, shift, scale):
++        if t.shape != (B, T, 1, C) or t.stride(-1) != 1 or t.dtype != x4.dtype:
++            return False
++        if B > 1 and t.stride(0) != T * t.stride(1):
++            return False
++    return True
++
++
++def _geak_add_ln_mod(x4, a4, gate, shift, scale, eps):
++    """(x4 + a4*gate) -> residual, then LayerNorm(residual)*scale + shift -> nh.
++
++    Exactly the three ops it replaces:
++        r  = torch.addcmul(x4, a4, gate)
++        nh = torch.addcmul(shift, norm(r), scale)
++    """
++    B, T, S, C = x4.shape
++    if _GEAK_FUSELN_MODE == 0:            # bisect: same control flow, stock kernels
++        r = torch.addcmul(x4, a4, gate)
++        return r, torch.addcmul(shift, F.layer_norm(r, (C,), None, None, eps), scale)
++    if not a4.is_contiguous():
++        a4 = a4.contiguous()
++    n = B * T * S
++    x = x4.reshape(n, C)
++    a = a4.reshape(n, C)
++    r = torch.empty_like(x)
++    o = torch.empty_like(x)
++    sbt = gate.stride(1)
++    args = (x, a, gate, shift, scale, r, o, sbt, S, float(eps))
++    if _GEAK_FUSELN_FAST:
++        ck = _geak_addln_compiled((n, C, sbt, S, x.dtype), args, (n,),
++                                  _GEAK_FUSELN_WARPS)
++        if ck is not None:
++            ck[(n, 1, 1)](*args)
++            return r.view(B, T, S, C), o.view(B, T, S, C)
++    _geak_addln_kernel[(n,)](
++        *args, C=C, BLOCK=C, num_warps=_GEAK_FUSELN_WARPS,
++        num_stages=_GEAK_FUSELN_STAGES,
++    )
++    return r.view(B, T, S, C), o.view(B, T, S, C)
++
++# ---------------------------------------------------------------------------
++# CAMPAIGN 2 ROUND 2 -- GEAK_DIT_FP8: the Cosmos block GEMMs in OCP fp8 (e4m3),
++# with the ACTIVATION QUANTISATION FOLDED INTO the fused add+LN kernel's row
++# reduction so it costs a narrower store instead of a whole extra pass.
++#
++# WHY.  Post-CAFUSE a block is at its structural minimum (13 device nodes for
++# 6 GEMMs + 2 attentions + 3 add+LN stages).  Its GEMMs are ~1.7-1.9 ms = 40% of
++# the dit_1step wall and they sit at the bf16 vendor optimum.  Precision is the
++# only axis left.  MEASURED on this box (HIP-graph replay, M=392):
++#
++#     shape                bf16    fp8 rowwise   fp8 per-tensor
++#     qkv    K2048 N6144   15.66   13.54 (1.16)  10.10 (1.55)
++#     proj   K2048 N2048    9.73    7.40 (1.32)   7.14 (1.36)
++#     ffup   K2048 N8192   23.51   13.29 (1.77)  12.12 (1.94)
++#     ffdown K8192 N2048   24.46   16.12 (1.52)  23.46 (1.04)   <- pt is useless
++#
++# ROWWISE (per-token activation, per-output-channel weight) is the shipped
++# recipe: it is the only granularity that pays on ffdown, it is the accurate one
++# (PTPC), and -- decisively -- it is the only one a per-row kernel can produce
++# for free.  A per-tensor activation scale needs a cross-program reduction, i.e.
++# a whole extra node, which is exactly the cost this direction has to avoid.
++#
++# WHAT IS AND IS NOT CONVERTED, and why (all costs measured, node floor 1.79 us):
++#   * QKV, cross q-proj, FF-up, FF-down  -> fp8.  Their activation is `nh`, the
++#     output of the fused add+LN stage, which already loads the whole 2048-wide
++#     row into registers and already runs two row reductions.  Adding the amax
++#     and storing fp8 instead of bf16 makes the stage store LESS (0.8 MB instead
++#     of 1.6 MB), so the quantisation is free-to-negative, not an afterthought.
++#   * The FF intermediate [392, 8192] is quantised by one fused GELU+quant
++#     kernel that replaces the hipBLASLt GELU epilogue we lose by leaving addmm.
++#   * self out-proj and cross out-proj STAY bf16.  Their activation is an
++#     attention output, not an add+LN output, so it would need its OWN quant
++#     node: measured 2.60 us for a [392, 2048] rowwise quant against a 2.33 us
++#     GEMM saving.  Converting them is a NET LOSS and they are left alone.
++#   * Block 0's QKV stays bf16: its `nh` comes from the loop preamble's addcmul,
++#     not from a fused stage, so the same 2.60-vs-2.12 arithmetic applies.
++#
++# NUMERICS.  fp8 e4m3 is ~3.7e-2 relative against bf16's 1.4e-3.  The value the
++# quantiser sees is rounded to bf16 first, i.e. it is EXACTLY the tensor the
++# bf16 GEMM would have consumed; only the GEMM's operand precision changes, the
++# accumulator stays fp32 and the output stays bf16.  The residual stream itself
++# is never quantised -- `r` stays bf16 through all 18 blocks -- so the error
++# enters as a per-block perturbation of the branch output and is damped by the
++# gate, rather than compounding along the skip path.  This is gated on the
++# closed-loop LIBERO rollout, not on a numeric tolerance (see report).
++#
++# gfx950 is OCP fp8 (e4m3fn / e5m2), NOT gfx942's FNUZ flavours; using the FNUZ
++# dtype here makes the compiler emulate the convert in software.
++#
++# Kill switch: GEAK_DIT_FP8=0 restores the bf16 path exactly (a different
++# add+LN kernel is not even compiled).  GEAK_DIT_FP8_OPS selects the shapes
++# ("qkv,cq,ff"), GEAK_DIT_FP8_L0/L1 the block range.
++# ---------------------------------------------------------------------------
++_GEAK_FP8 = _geak_flag("GEAK_DIT_FP8")
++_GEAK_FP8_OPS = set(x for x in _geak_os.environ.get(
++    "GEAK_DIT_FP8_OPS", "qkv,cq,ff").replace(" ", "").split(",") if x)
++_GEAK_FP8_L0 = int(_geak_os.environ.get("GEAK_DIT_FP8_L0", "0"))
++_GEAK_FP8_L1 = int(_geak_os.environ.get("GEAK_DIT_FP8_L1", "999"))
++_GEAK_FP8_ECHO = _geak_flag("GEAK_DIT_FP8_ECHO", "0")
++_GEAK_FP8_GQW = int(_geak_os.environ.get("GEAK_DIT_FP8_GQW", "8"))
++# ---------------------------------------------------------------------------
++# CAMPAIGN 2 ROUND 3 -- GEAK_DIT_GELUPOLY / GEAK_DIT_QRCP: the two fp8 quantiser
++# kernels this file owns were spending most of their time on SCALAR MATH, not on
++# memory, and both costs are invisible against an fp8 output.
++#
++# MEASURED on this box (HIP-graph replay, real shapes, so the triton python
++# launcher is not in the number; in-graph node floor 2.06 us):
++#
++#   _geak_geluq_kernel  [392, 8192]        (9.6 MB moved)
++#     exact-erf + per-element divide            7.40 us   <- round-2 shipped
++#     exact-erf, reciprocal multiply            ~6.3 us
++#     poly GELU + per-element divide            5.02 us
++#     poly GELU + reciprocal multiply           3.86 us   <- shipped
++#     quantise only, no activation at all       4.16 us   (the memory floor)
++#   _geak_addln_q8_kernel [392, 2048]      (5.6 MB moved)
++#     per-element divide                        3.90 us   <- round-2 shipped
++#     reciprocal multiply                       3.62 us   <- shipped
++#
++# (1) THE DIVIDE.  `o / s` with a per-ROW scalar `s` emits a full IEEE fp32
++#     division per ELEMENT -- 8192 of them per program in geluq.  Hoisting one
++#     reciprocal (`fmax / am`) out of the row and multiplying is 8192 v_mul
++#     against 8192 divide expansions: -1.16 us in geluq, -0.28 us in addln_q8.
++#     The stored scale is still `am / fmax`, so the GEMM's dequantisation is
++#     unchanged; only the quantisation rounds through a reciprocal, i.e. ~1e-7
++#     relative on a value that is about to be rounded to THREE mantissa bits.
++#
++# (2) THE ERF.  `tl.math.erf` is an ocml call.  Its result is immediately
++#     rounded to bf16 and then quantised to OCP e4m3, whose relative grain is
++#     ~6e-2 -- five orders coarser than erf's exactness.  A degree-13 odd
++#     minimax polynomial for Phi(x) = 0.5(1 + erf(x/sqrt2)) on a clamped
++#     [-4, 4], evaluated as 0.5 + t*P(t^2) in seven FMAs, is -1.16 us more.
++#     max|Phi err| 4.4e-4 => max|gelu err| 1.8e-3 in range; above +4 the form
++#     degrades to 0.99997*x (a 3.2e-5 RELATIVE error, self-scaling), and below
++#     -4 it is forced to exactly 0 (true value there is |gelu| < 1.3e-4).
++#     MEASURED end to end on the real [392, 8192] distribution, both against the
++#     exact bf16 GELU: the shipped erf path's own fp8 error is 2.6458e-2 and the
++#     polynomial path's is 2.6464e-2 -- the approximation contributes 0.02% of an
++#     error the kernel was already committing.
++#
++# Kill switches, independent, both default ON:
++#   GEAK_DIT_GELUPOLY=0 -> exact `tl.math.erf` back in _geak_geluq_kernel
++#   GEAK_DIT_QRCP=0     -> per-element divide back in BOTH quantiser kernels
++# Both are compile-time `tl.constexpr` on the kernels, so an OFF arm is the
++# round-2 kernel instruction for instruction, not a runtime branch.
++# ---------------------------------------------------------------------------
++_GEAK_GELUPOLY = _geak_flag("GEAK_DIT_GELUPOLY")
++_GEAK_QRCP = _geak_flag("GEAK_DIT_QRCP")
++try:
++    _GEAK_F8 = torch.float8_e4m3fn            # OCP e4m3 -- gfx950, NOT e4m3fnuz
++except Exception:                             # pragma: no cover
++    _GEAK_F8 = None
++_GEAK_F8MAX = 448.0
++_geak_q8_slot = [None]
++_geak_fp8_seen = [0]
++_geak_addlnq_cache = {}
++_geak_geluq_cache = {}
++
++
++if _GEAK_TRITON_OK:
++
++    @_geak_triton.jit
++    def _geak_addln_q8_kernel(
++        X, A, G, SH, SC, R, O, OS,
++        s_bt, HW, eps, fmax,
++        RCP: _geak_tl.constexpr,
++        C: _geak_tl.constexpr, BLOCK: _geak_tl.constexpr,
++    ):
++        """`_geak_addln_kernel` with the modulated output emitted as row-scaled
++        fp8.  Every intermediate is rounded at exactly the same points; the only
++        added arithmetic is the row amax, which reuses the tile already in
++        registers, and the store is HALF the bytes."""
++        row = _geak_tl.program_id(0)
++        gt = row // HW
++        od = _geak_tl.arange(0, BLOCK)
++        m = od < C
++        x = _geak_tl.load(X + row * C + od, mask=m, other=0.0).to(_geak_tl.float32)
++        a = _geak_tl.load(A + row * C + od, mask=m, other=0.0).to(_geak_tl.float32)
++        g = _geak_tl.load(G + gt * s_bt + od, mask=m, other=0.0).to(_geak_tl.float32)
++        r = (x + a * g).to(R.dtype.element_ty)
++        _geak_tl.store(R + row * C + od, r, mask=m)
++        rf = _geak_tl.where(m, r.to(_geak_tl.float32), 0.0)
++        mu = _geak_tl.sum(rf, 0) / C
++        d = _geak_tl.where(m, rf - mu, 0.0)
++        var = _geak_tl.sum(d * d, 0) / C
++        y = (d * _geak_tl.rsqrt(var + eps)).to(R.dtype.element_ty).to(_geak_tl.float32)
++        sh = _geak_tl.load(SH + gt * s_bt + od, mask=m, other=0.0).to(_geak_tl.float32)
++        sc = _geak_tl.load(SC + gt * s_bt + od, mask=m, other=0.0).to(_geak_tl.float32)
++        o = (sh + y * sc).to(R.dtype.element_ty).to(_geak_tl.float32)
++        am = _geak_tl.maximum(_geak_tl.max(_geak_tl.abs(_geak_tl.where(m, o, 0.0)), 0), 1e-12)
++        _geak_tl.store(OS + row, am / fmax)
++        if RCP:
++            # one reciprocal per ROW instead of one fp32 divide per ELEMENT
++            _geak_tl.store(O + row * C + od,
++                           (o * (fmax / am)).to(O.dtype.element_ty), mask=m)
++        else:
++            _geak_tl.store(O + row * C + od,
++                           (o / (am / fmax)).to(O.dtype.element_ty), mask=m)
++
++    @_geak_triton.jit
++    def _geak_geluq_kernel(X, O, S, fmax,
++                           POLY: _geak_tl.constexpr, RCP: _geak_tl.constexpr,
++                           C: _geak_tl.constexpr, BLOCK: _geak_tl.constexpr):
++        """GELU + rowwise fp8 quantisation of the FF intermediate, one pass: the
++        row is held in registers so the 6.4 MB input is read once.  See the
++        GEAK_DIT_GELUPOLY / GEAK_DIT_QRCP header for the measured economics."""
++        row = _geak_tl.program_id(0)
++        od = _geak_tl.arange(0, BLOCK)
++        m = od < C
++        x = _geak_tl.load(X + row * C + od, mask=m, other=0.0).to(_geak_tl.float32)
++        if POLY:
++            # Phi(x) = 0.5 + t*P(t^2) on t = clamp(x, -4, 4); degree-13 odd
++            # minimax fit, max|Phi err| 4.4e-4.  Seven FMAs, no ocml call.
++            t = _geak_tl.minimum(_geak_tl.maximum(x, -4.0), 4.0)
++            t2 = t * t
++            p = 3.3380286468e-08
++            p = p * t2 + -2.1534260261e-06
++            p = p * t2 + 5.9239066696e-05
++            p = p * t2 + -9.2596706852e-04
++            p = p * t2 + 9.3276899275e-03
++            p = p * t2 + -6.5818945608e-02
++            p = p * t2 + 3.9878930561e-01
++            # below -4 the exact value is |gelu| < 1.3e-4; pin it to 0 so the
++            # clamped polynomial cannot leak a growing NEGATIVE tail.
++            g = _geak_tl.where(x < -4.0, 0.0, x * (0.5 + t * p))
++        else:
++            g = x * 0.5 * (1.0 + _geak_tl.math.erf(x * 0.70710678118654752))
++        gb = g.to(X.dtype.element_ty).to(_geak_tl.float32)
++        am = _geak_tl.maximum(_geak_tl.max(_geak_tl.abs(_geak_tl.where(m, gb, 0.0)), 0), 1e-12)
++        _geak_tl.store(S + row, am / fmax)
++        if RCP:
++            _geak_tl.store(O + row * C + od,
++                           (gb * (fmax / am)).to(O.dtype.element_ty), mask=m)
++        else:
++            _geak_tl.store(O + row * C + od,
++                           (gb / (am / fmax)).to(O.dtype.element_ty), mask=m)
++
++
++def _geak_fp8_w(owner, key, weight):
++    """(mat2 [K,N] column-major fp8, scale [1,N] fp32) for `weight` [N,K],
++    per-output-channel.  Cached on `owner`; never built inside a graph capture
++    (that would bake the quantisation into the replay)."""
++    c = getattr(owner, key, None)
++    if c is not None:
++        return c
++    if _GEAK_F8 is None or weight is None:
++        setattr(owner, key, False)
++        return False
++    try:
++        if torch.cuda.is_current_stream_capturing():
++            return False                       # retry outside capture, do NOT cache
++    except Exception:
++        pass
++    c = False
++    try:
++        if (weight.is_cuda and weight.ndim == 2 and weight.shape[1] % 16 == 0
++                and weight.shape[0] % 16 == 0):
++            s = (weight.float().abs().amax(1, keepdim=True) / _GEAK_F8MAX).clamp(min=1e-12)
++            q = (weight.float() / s).clamp(-_GEAK_F8MAX, _GEAK_F8MAX).to(_GEAK_F8).contiguous()
++            c = (q.t(), s.view(1, -1).float().contiguous())
++    except Exception:
++        c = False
++    setattr(owner, key, c)
++    return c
++
++
++def _geak_f8mm(x8, xs, plan):
++    return torch._scaled_mm(x8, plan[0], scale_a=xs, scale_b=plan[1],
++                            out_dtype=torch.bfloat16)
++
++
++def _geak_geluq(h):
++    """GELU + rowwise fp8 quantisation.  h: [n, C] bf16 -> ([n, C] fp8, [n,1] fp32)."""
++    n, C = h.shape
++    o = torch.empty((n, C), device=h.device, dtype=_GEAK_F8)
++    s = torch.empty((n, 1), device=h.device, dtype=torch.float32)
++    args = (h, o, s, _GEAK_F8MAX)
++    key = (n, C, h.dtype, _GEAK_GELUPOLY, _GEAK_QRCP)
++    if _GEAK_FUSELN_FAST:
++        if key not in _geak_geluq_cache:
++            ck = None
++            try:
++                kk = _geak_geluq_kernel[(n,)](*args, POLY=_GEAK_GELUPOLY,
++                                              RCP=_GEAK_QRCP, C=C, BLOCK=C,
++                                              num_warps=_GEAK_FP8_GQW, num_stages=1)
++                if kk is not None and hasattr(kk, "run") and hasattr(kk, "__getitem__"):
++                    ck = kk
++            except Exception:
++                ck = None
++            _geak_geluq_cache[key] = ck
++        ck = _geak_geluq_cache[key]
++        if ck is not None:
++            ck[(n, 1, 1)](*args)
++            return o, s
++    _geak_geluq_kernel[(n,)](*args, POLY=_GEAK_GELUPOLY, RCP=_GEAK_QRCP,
++                             C=C, BLOCK=C,
++                             num_warps=_GEAK_FP8_GQW, num_stages=1)
++    return o, s
++
++
++def _geak_ff_fp8(ff, x8, xs):
++    pu = getattr(ff, "_geak_f8u", None)
++    pd = getattr(ff, "_geak_f8d", None)
++    h = _geak_f8mm(x8, xs, pu)
++    h8, hs = _geak_geluq(h)
++    return _geak_f8mm(h8, hs, pd)
++
++
++def _geak_add_ln_mod_q(x4, a4, gate, shift, scale, eps):
++    """`_geak_add_ln_mod` whose second output is row-scaled fp8.
++    Returns (residual [B,T,S,C] bf16, (o8 [n,C] fp8, os [n,1] fp32, o8 [B,n/B,C]))."""
++    B, T, S, C = x4.shape
++    if not a4.is_contiguous():
++        a4 = a4.contiguous()
++    n = B * T * S
++    x = x4.reshape(n, C)
++    a = a4.reshape(n, C)
++    r = torch.empty_like(x)
++    o = torch.empty((n, C), device=x.device, dtype=_GEAK_F8)
++    os_ = torch.empty((n, 1), device=x.device, dtype=torch.float32)
++    sbt = gate.stride(1)
++    args = (x, a, gate, shift, scale, r, o, os_, sbt, S, float(eps), _GEAK_F8MAX)
++    key = (n, C, sbt, S, x.dtype, _GEAK_QRCP)
++    launched = False
++    if _GEAK_FUSELN_FAST:
++        if key not in _geak_addlnq_cache:
++            ck = None
++            try:
++                kk = _geak_addln_q8_kernel[(n,)](
++                    *args, RCP=_GEAK_QRCP, C=C, BLOCK=C,
++                    num_warps=_GEAK_FUSELN_WARPS,
++                    num_stages=_GEAK_FUSELN_STAGES)
++                if kk is not None and hasattr(kk, "run") and hasattr(kk, "__getitem__"):
++                    ck = kk
++            except Exception:
++                ck = None
++            _geak_addlnq_cache[key] = ck
++        ck = _geak_addlnq_cache[key]
++        if ck is not None:
++            ck[(n, 1, 1)](*args)
++            launched = True
++    if not launched:
++        _geak_addln_q8_kernel[(n,)](
++            *args, RCP=_GEAK_QRCP, C=C, BLOCK=C, num_warps=_GEAK_FUSELN_WARPS,
++            num_stages=_GEAK_FUSELN_STAGES)
++    return r.view(B, T, S, C), (o, os_, o.view(B, n // B, C))
++
++
++
++
+ class CosmosPatchEmbed(nn.Module):
+     def __init__(
+         self, in_channels: int, out_channels: int, patch_size: Tuple[int, int, int], bias: bool = True
+@@ -150,6 +1425,242 @@
+         return hidden_states, gate
+ 
+ 
++def _geak_rms(norm, x):
++    """diffusers' RMSNorm.forward is 7-8 separate launches (to-fp32, pow, mean, add,
++    rsqrt, mul, to-bf16, mul-weight).  `F.rms_norm` is the same arithmetic in ONE
++    fused kernel.  72 QK-norm calls per video-DiT forward makes this ~430 launches."""
++    if _GEAK_RMS:
++        w = getattr(norm, "weight", None)
++        if (
++            w is not None
++            and getattr(norm, "bias", None) is None
++            and getattr(norm, "elementwise_affine", False)
++            and hasattr(norm, "dim")
++            and w.dtype == x.dtype
++        ):
++            d = tuple(norm.dim)
++            # GEAK_DIT_QNORM: torch's rms-norm puts one CTA on each 256-byte head
++            # row; the triton kernel puts one program on each 4 KB token row.
++            if len(d) == 1 and _geak_qnorm_ok(x, w) and d[0] == x.shape[-1]:
++                return _geak_qnorm(x, w, norm.eps)
++            return F.rms_norm(x, d, w, norm.eps)
++    return norm(x)
++
++
++def _geak_apply_rope(x, cos, sin):
++    """`apply_rotary_emb(use_real=True, use_real_unbind_dim=-2)` with the two explicit
++    `.float()` casts and the separate add folded into one promoted addcmul.
++    Same fp32 multiply-accumulate, 5 launches instead of 8."""
++    x_real, x_imag = x.reshape(*x.shape[:-1], 2, -1).unbind(-2)
++    x_rotated = torch.cat([-x_imag, x_real], dim=-1)
++    return torch.addcmul(x * cos, x_rotated, sin).to(x.dtype)
++
++
++def _geak_call_attn(attn, hidden_states, encoder_hidden_states, attention_mask, image_rotary_emb):
++    """`diffusers.Attention.forward` runs `inspect.signature(self.processor.__call__)`
++    on EVERY call (tens of microseconds of pure Python x 36 calls per forward) purely
++    to filter kwargs we are not passing.  Dispatch to the processor directly."""
++    p = attn.processor
++    if _GEAK_DIRECT and type(p) is CosmosAttnProcessor2_0:
++        return p(
++            attn,
++            hidden_states,
++            encoder_hidden_states=encoder_hidden_states,
++            attention_mask=attention_mask,
++            image_rotary_emb=image_rotary_emb,
++        )
++    if image_rotary_emb is None:
++        return attn(hidden_states, encoder_hidden_states=encoder_hidden_states, attention_mask=attention_mask)
++    return attn(hidden_states, image_rotary_emb=image_rotary_emb)
++
++
++def _geak_rope_qk_tables(attn, cos, sin, wqk, D):
++    """cos/sin tables with the q/k RMS gains PRE-FOLDED and the RoPE sign pattern baked
++    into sin, so the joint q+k rotation becomes
++
++        out = x * cosw  +  roll(x, D/2, -1) * sinw
++
++    -- a `roll` (one kernel) instead of `neg` + `cat` (two), and no separate affine
++    multiply at all.  Measured on the real shape: 43.6 us -> 25.6 us per block.
++    The tables are a pure function of (cos, sin, wqk); the cache holds a strong
++    reference to cos/sin, so a data_ptr match cannot be a recycled allocation (the
++    storage is pinned alive by the cache itself).  Recomputed on the first call only.
++    Inference tensors carry no version counter, hence the identity/pointer key."""
++    c = getattr(attn, "_geak_ropeqk", None)
++    if c is not None:
++        _oc, _os_ = c[3], c[4]
++        if (_oc is cos and _os_ is sin) or (
++            _oc.data_ptr() == cos.data_ptr()
++            and _os_.data_ptr() == sin.data_ptr()
++            and _oc.shape == cos.shape
++            and _os_.shape == sin.shape
++            and _oc.dtype == cos.dtype
++        ):
++            return c[1], c[2]
++    h = D // 2
++    c5 = cos[None, None, :, None, :]
++    s5 = sin[None, None, :, None, :]
++    cosw = (c5 * wqk).contiguous()
++    sw = s5 * torch.roll(wqk, h, dims=-1)
++    sinw = torch.cat([-sw[..., :h], sw[..., h:]], dim=-1).contiguous()
++    attn._geak_ropeqk = (None, cosw, sinw, cos, sin)
++    return cosw, sinw
++
++
++def _geak_qk_weight(attn, D):
++    """[2, 1, 1, 1, D] stack of norm_q.weight / norm_k.weight, cached on the module,
++    so the joint q+k RMS-norm can run affine-free on one contiguous tensor."""
++    w = getattr(attn, "_geak_qkw", None)
++    if w is not None:
++        return w
++    try:
++        nq, nk = attn.norm_q, attn.norm_k
++        wq, wk = nq.weight, nk.weight
++        if (
++            wq is None or wk is None
++            or getattr(nq, "bias", None) is not None or getattr(nk, "bias", None) is not None
++            or not getattr(nq, "elementwise_affine", False)
++            or not getattr(nk, "elementwise_affine", False)
++            or tuple(nq.dim) != (D,) or tuple(nk.dim) != (D,)
++            or float(nq.eps) != float(nk.eps)
++        ):
++            w = (False, 0.0)
++        else:
++            w = (torch.stack((wq, wk), 0).view(2, 1, 1, 1, D).contiguous(), float(nq.eps))
++    except Exception:
++        w = (False, 0.0)
++    attn._geak_qkw = w
++    return w
++
++
++def _geak_qkv_weight(attn):
++    """One [3*inner, C] matrix for to_q/to_k/to_v so self-attention issues ONE GEMM
++    instead of three launch-floor GEMMs.  Identical arithmetic (same K reduction),
++    cached on the module."""
++    w = getattr(attn, "_geak_qkvw", None)
++    if w is not None:
++        return w
++    try:
++        lq, lk, lv = attn.to_q, attn.to_k, attn.to_v
++        if any(getattr(l, "bias", None) is not None for l in (lq, lk, lv)):
++            attn._geak_qkvw = False
++            return False
++        w = torch.cat([lq.weight, lk.weight, lv.weight], dim=0).contiguous()
++    except Exception:
++        w = False
++    attn._geak_qkvw = w
++    return w
++
++
++# ---------------------------------------------------------------------------
++# ROUND 3 -- GEAK_DIT_FASTFN: call the block's Linear/GELU/Dropout leaves as
++# functions instead of as nn.Modules.
++#
++# After the two fusions above, region C is down to ~15 dispatches per block and
++# its wall (4.55 ms) sits ~1.3 ms above its device time, i.e. it is still
++# host-issue bound.  A large slice of that host time is not the launch at all --
++# it is `nn.Module._call_impl`, which runs on every one of the ~7 Linear /
++# GELU / Dropout leaves per block (FeedForward alone is 5 module calls: the
++# ModuleList loop plus GELU's proj+gelu, plus a Dropout(p=0) that dispatches
++# `aten::dropout` and returns its input).  Hoisting the parameters once and
++# calling F.linear / F.gelu directly is bit-for-bit the same arithmetic with
++# none of the dispatch.
++# ---------------------------------------------------------------------------
++_GEAK_FASTFN = _geak_flag("GEAK_DIT_FASTFN")
++
++
++def _geak_linear_params(mod):
++    """(weight, bias) for an nn.Linear, else False."""
++    c = getattr(mod, "_geak_lp", None)
++    if c is not None:
++        return c
++    c = (mod.weight, mod.bias) if isinstance(mod, nn.Linear) else False
++    mod._geak_lp = c
++    return c
++
++
++def _geak_out_params(attn):
++    """(weight, bias) of to_out[0] when to_out[1] is an inert Dropout."""
++    c = getattr(attn, "_geak_outp", None)
++    if c is not None:
++        return c
++    c = False
++    try:
++        o = attn.to_out
++        if (len(o) == 2 and isinstance(o[0], nn.Linear)
++                and isinstance(o[1], nn.Dropout) and float(o[1].p) == 0.0):
++            c = (o[0].weight, o[0].bias)
++    except Exception:
++        c = False
++    attn._geak_outp = c
++    return c
++
++
++def _geak_ff_params(ff):
++    """(w1, b1, w2, b2, approximate) for diffusers' FeedForward(gelu), else False."""
++    c = getattr(ff, "_geak_ffp", None)
++    if c is not None:
++        return c
++    c = False
++    try:
++        net = ff.net
++        # POSITIONAL-STRUCTURE GUARD (round-4 lesson): diffusers appends an extra
++        # Dropout when `final_dropout=True`, so len(net) is 3 OR 4.  A strict
++        # `len(net)==3` test fails CLOSED -- invisible to every benchmark.
++        ok_len = (len(net) == 3
++                  or (len(net) == 4 and isinstance(net[3], nn.Dropout)
++                      and float(net[3].p) == 0.0))
++        if ok_len:
++            act, drop, lin2 = net[0], net[1], net[2]
++            if (type(act).__name__ == "GELU" and isinstance(getattr(act, "proj", None), nn.Linear)
++                    and isinstance(drop, nn.Dropout) and float(drop.p) == 0.0
++                    and isinstance(lin2, nn.Linear)):
++                # epilogue plan for GEAK_DIT_FFGELU: (mat2 = w1^T view, bias vector)
++                w1 = act.proj.weight
++                epi = None
++                try:
++                    b1 = act.proj.bias
++                    if b1 is None:
++                        b1 = torch.zeros(w1.shape[0], dtype=w1.dtype, device=w1.device)
++                    if b1.dtype == w1.dtype and b1.shape == (w1.shape[0],):
++                        epi = (w1.t(), b1)
++                except Exception:
++                    epi = None
++                c = (w1, act.proj.bias, lin2.weight, lin2.bias,
++                     getattr(act, "approximate", "none"), epi)
++    except Exception:
++        c = False
++    ff._geak_ffp = c
++    return c
++
++
++def _geak_ff(ff, x):
++    if _GEAK_FASTFN:
++        p = _geak_ff_params(ff)
++        if p is not False:
++            if _GEAK_FFGELU and p[5] is not None and x.is_cuda:
++                x2 = x if x.ndim == 2 else x.reshape(-1, x.shape[-1])
++                h = torch._addmm_activation(p[5][1], x2, p[5][0], use_gelu=True)
++                o = F.linear(h, p[2], p[3])
++                return o if x.ndim == 2 else o.view(*x.shape[:-1], o.shape[-1])
++            return F.linear(F.gelu(F.linear(x, p[0], p[1]), approximate=p[4]), p[2], p[3])
++    return ff(x)
++
++
++def _geak_finish_attention(attn, query, key, value, attention_mask):
++    hidden_states = F.scaled_dot_product_attention(
++        query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
++    )
++    hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).type_as(query)
++    if _GEAK_FASTFN:
++        p = _geak_out_params(attn)
++        if p is not False:
++            return F.linear(hidden_states, p[0], p[1])
++    hidden_states = attn.to_out[0](hidden_states)
++    hidden_states = attn.to_out[1](hidden_states)
++    return hidden_states
++
++
+ class CosmosAttnProcessor2_0:
+     def __init__(self):
+         if not hasattr(F, "scaled_dot_product_attention"):
+@@ -164,27 +1675,172 @@
+         image_rotary_emb: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor:
+         # 1. QKV projections
++        _geak_kv_src = encoder_hidden_states if _GEAK_TXTCACHE else None
++        # GEAK_DIT_FP8: the caller may have handed us a row-scaled fp8 activation
++        # in place of a bf16 one; `hidden_states` is then the fp8 view of it and
++        # the projection GEMM below becomes a _scaled_mm.  Consume the slot here
++        # so no later call can ever see a stale one.
++        _q8 = _geak_q8_slot[0]
++        if _q8 is not None:
++            _geak_q8_slot[0] = None
+         if encoder_hidden_states is None:
+             encoder_hidden_states = hidden_states
+ 
+-        query = attn.to_q(hidden_states)
++        # --- GEAK: fused-QKV self-attention -------------------------------
++        if _geak_kv_src is None and encoder_hidden_states is hidden_states and _GEAK_QKV:
++            _w = _geak_qkv_weight(attn)
++            if _w is not False:
++                _b, _s2, _ = hidden_states.shape
++                # ---- GEAK_DIT_QKV2: stay in B,S,H,D all the way to SDPA ----
++                # The old path permuted to B,H,S,D *first*, which cost (a) two
++                # `.contiguous()` clones inside `_fused_rms_norm`, (b) a separate
++                # `torch.stack` to pair q with k for the joint RoPE, and (c) a copy
++                # inside SDPA, because the flash kernel consumes B,S,H,D and the
++                # B,H,S,D-contiguous tensors it was handed are not that.  Building the
++                # [2, B, S, H, D] pair ONCE gives a single clone, a single RMS-norm over
++                # twice the rows, and q/k that are contiguous B,S,H,D slices -- exactly
++                # the flash layout, so SDPA's own copy disappears too.
++                _f8qkv = getattr(attn, "_geak_f8qkv", None) if _q8 is not None else None
++                if _GEAK_QKV2 and image_rotary_emb is not None and _GEAK_ROPE and _GEAK_RMS:
++                    _t = (_geak_f8mm(_q8[0], _q8[1], _f8qkv) if _f8qkv
++                          else F.linear(hidden_states, _w)).view(_b, _s2, 3, attn.heads, -1)
++                    _D = _t.shape[-1]
++                    _wqk, _eps = _geak_qk_weight(attn, _D)
++                    if _wqk is not False and _GEAK_FUSEQK and _GEAK_TRITON_OK \
++                            and _t.is_contiguous() and not _GEAK_ROLLROPE:
++                        _cos, _sin = image_rotary_emb
++                        if (_cos.is_contiguous() and _sin.is_contiguous()
++                                and _cos.shape == (_s2, _D) and _cos.dtype == torch.float32):
++                            _q, _k = _geak_qkrope(_t, _wqk, _cos, _sin, _eps)
++                            return _geak_finish_attention(
++                                attn, _q.transpose(1, 2), _k.transpose(1, 2),
++                                _t[:, :, 2].permute(0, 2, 1, 3), attention_mask,
++                            )
++                    if _wqk is not False:
++                        qk = torch.stack((_t[:, :, 0], _t[:, :, 1]), 0)   # [2,B,S,H,D]
++                        # rms_norm without affine + one broadcast multiply by the stacked
++                        # q/k gains: same arithmetic as two affine rms_norms, one extra
++                        # bf16 rounding on the normalised value.
++                        qk = F.rms_norm(qk, (_D,), None, _eps)
++                        _cos, _sin = image_rotary_emb
++                        if _GEAK_ROLLROPE:
++                            _cw, _sw = _geak_rope_qk_tables(attn, _cos, _sin, _wqk, _D)
++                            qk = torch.addcmul(
++                                qk * _cw, torch.roll(qk, _D // 2, dims=-1), _sw
++                            ).to(qk.dtype)
++                        else:
++                            qk = _geak_apply_rope(
++                                qk * _wqk,
++                                _cos[None, None, :, None, :],
++                                _sin[None, None, :, None, :],
++                            )
++                        return _geak_finish_attention(
++                            attn,
++                            qk[0].transpose(1, 2),
++                            qk[1].transpose(1, 2),
++                            _t[:, :, 2].permute(0, 2, 1, 3),
++                            attention_mask,
++                        )
++                qkv = ((_geak_f8mm(_q8[0], _q8[1], _f8qkv) if _f8qkv
++                        else F.linear(hidden_states, _w))
++                       .view(_b, _s2, 3, attn.heads, -1).permute(2, 0, 3, 1, 4))
++                query = _geak_rms(attn.norm_q, qkv[0])
++                key = _geak_rms(attn.norm_k, qkv[1])
++                value = qkv[2]
++                if image_rotary_emb is not None and _GEAK_ROPE:
++                    _cos, _sin = image_rotary_emb
++                    qk = _geak_apply_rope(
++                        torch.stack((query, key), 0),
++                        _cos[None, None, None, :, :],
++                        _sin[None, None, None, :, :],
++                    )
++                    query, key = qk[0], qk[1]
++                elif image_rotary_emb is not None:
++                    from ..embeddings import apply_rotary_emb
++
++                    query = apply_rotary_emb(query, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
++                    key = apply_rotary_emb(key, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
++                return _geak_finish_attention(attn, query, key, value, attention_mask)
++
++        # GEAK_DIT_NORMPRE: normalise BEFORE the head transpose.  `to_q`'s output is
++        # contiguous [B, S, H, D]; transposing first hands `F.rms_norm` a non-contiguous
++        # [B, H, S, D] which `_fused_rms_norm` silently repairs with a full
++        # `.contiguous()` clone (measured: 54 x 7.16 us = 0.387 ms/iter of pure layout
++        # churn).  RMS-norm is per-last-dim, so the two orders are BITWISE identical
++        # (verified: torch.equal == True), and the resulting BSHD-strided query is also
++        # exactly what the flash kernel wants, so SDPA's own input copy disappears too.
++        _f8q = getattr(attn, "_geak_f8q", None) if _q8 is not None else None
++        if _f8q:
++            query = _geak_f8mm(_q8[0], _q8[1], _f8q).view(
++                hidden_states.shape[0], hidden_states.shape[1], -1
++            ).unflatten(2, (attn.heads, -1))
++        elif _GEAK_FASTFN:
++            _lp = _geak_linear_params(attn.to_q)
++            query = (F.linear(hidden_states, _lp[0], _lp[1]) if _lp is not False
++                     else attn.to_q(hidden_states)).unflatten(2, (attn.heads, -1))
++        else:
++            query = attn.to_q(hidden_states).unflatten(2, (attn.heads, -1))
++
++        # --- GEAK_DIT_CAFUSE: fold the query RMS-norm into the attention -----
++        # Only on the cross-attention KV-cache HIT, which is the only cross-attn
++        # shape the block loop ever runs.  `query` is still the raw, unnormalised
++        # [B, S, H, D] projection output here; the fused kernel does the norm on
++        # the q tile it loads anyway.  Falls through to the stock path on any
++        # miss, so nothing about eligibility can fail open.
++        if (_GEAK_CAFUSE and attention_mask is None and image_rotary_emb is None
++                and _geak_kv_src is not None):
++            _u = getattr(_geak_kv_src, "_geak_kv_uid", None)
++            if _u is not None:
++                _cc = getattr(attn, "_geak_kv_cache", None)
++                if _cc is not None and _cc[0] == _u:
++                    _r = _geak_cross_attn_fused(attn, query, _cc[1], _cc[2])
++                    if _r is not None:
++                        return _r
++
++        if _GEAK_NORMPRE:
++            query = _geak_rms(attn.norm_q, query).transpose(1, 2)
++        else:
++            query = _geak_rms(attn.norm_q, query.transpose(1, 2))
++
++        # --- GEAK: cross-attention K/V memoization -------------------------
++        # For cross attention the key/value tensors are a pure function of the
++        # (fixed, prompt-derived) encoder_hidden_states: no RoPE is applied to
++        # them (image_rotary_emb is None on the cross-attn call) and to_k/to_v/
++        # norm_k carry no state. `_geak_kv_uid` is stamped by
++        # CosmosTransformer3DModel.forward and is derived from the text-encoder
++        # cache key, so a prompt change is a guaranteed miss.
++        _kv_uid = getattr(_geak_kv_src, "_geak_kv_uid", None) if _geak_kv_src is not None else None
++        if _kv_uid is not None and image_rotary_emb is None:
++            _c = getattr(attn, "_geak_kv_cache", None)
++            if _c is not None and _c[0] == _kv_uid:
++                key, value = _c[1], _c[2]
++                return _geak_finish_attention(attn, query, key, value, attention_mask)
++
+         key = attn.to_k(encoder_hidden_states)
+         value = attn.to_v(encoder_hidden_states)
+ 
+-        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+-        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+         value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+ 
+-        # 2. QK normalization
+-        query = attn.norm_q(query)
+-        key = attn.norm_k(key)
++        # 2. QK normalization (same pre-transpose reordering as the query above)
++        key = key.unflatten(2, (attn.heads, -1))
++        if _GEAK_NORMPRE:
++            key = _geak_rms(attn.norm_k, key).transpose(1, 2)
++        else:
++            key = _geak_rms(attn.norm_k, key.transpose(1, 2))
+ 
+         # 3. Apply RoPE
+         if image_rotary_emb is not None:
+-            from ..embeddings import apply_rotary_emb
++            if _GEAK_ROPE and isinstance(image_rotary_emb, (tuple, list)) and len(image_rotary_emb) == 2:
++                _cos, _sin = image_rotary_emb
++                _cos = _cos[None, None, :, :]
++                _sin = _sin[None, None, :, :]
++                query = _geak_apply_rope(query, _cos, _sin)
++                key = _geak_apply_rope(key, _cos, _sin)
++            else:
++                from ..embeddings import apply_rotary_emb
+ 
+-            query = apply_rotary_emb(query, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
+-            key = apply_rotary_emb(key, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
++                query = apply_rotary_emb(query, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
++                key = apply_rotary_emb(key, image_rotary_emb, use_real=True, use_real_unbind_dim=-2)
+ 
+         # 4. Prepare for GQA
+         if torch.onnx.is_in_onnx_export():
+@@ -196,20 +1852,110 @@
+             query_idx = query.size(3)
+             key_idx = key.size(3)
+             value_idx = value.size(3)
+-        key = key.repeat_interleave(query_idx // key_idx, dim=3)
+-        value = value.repeat_interleave(query_idx // value_idx, dim=3)
+-
+-        # 5. Attention
+-        hidden_states = F.scaled_dot_product_attention(
+-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+-        )
+-        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3).type_as(query)
+-
+-        # 6. Output projection
+-        hidden_states = attn.to_out[0](hidden_states)
+-        hidden_states = attn.to_out[1](hidden_states)
+-
+-        return hidden_states
++        # GEAK: on this checkpoint heads_kv == heads_q so the ratio is always 1 and
++        # `repeat_interleave(1)` is a pure device-to-device copy. Skip it (exact).
++        if not _GEAK_RIGUARD or query_idx != key_idx:
++            key = key.repeat_interleave(query_idx // key_idx, dim=3)
++        if not _GEAK_RIGUARD or query_idx != value_idx:
++            value = value.repeat_interleave(query_idx // value_idx, dim=3)
++
++        if _kv_uid is not None and image_rotary_emb is None:
++            attn._geak_kv_cache = (_kv_uid, key, value)
++
++        return _geak_finish_attention(attn, query, key, value, attention_mask)
++
++
++# ---------------------------------------------------------------------------
++# ROUND 3 -- GEAK_DIT_FASTATT: a straight-line self/cross attention call for the
++# block loop.
++#
++# Every eligibility test in CosmosAttnProcessor2_0 (six module-level flags, two
++# cached-weight getattrs, the tuple/shape/dtype checks on the RoPE tables, the
++# GQA repeat_interleave guard) is a pure function of the module and re-evaluated
++# 36 times per forward.  Resolve it ONCE per Attention module and keep a plan
++# tuple; the per-call path is then one getattr and the arithmetic.  Same kernels,
++# same order, same numerics -- only the Python disappears.  Anything that fails
++# the setup falls back to the general processor.
++# ---------------------------------------------------------------------------
++_GEAK_FASTATT = _geak_flag("GEAK_DIT_FASTATT", "0")   # MEASURED NEUTRAL (11.060/11.001 vs 11.042/11.003), kept OFF
++
++
++def _geak_selfattn_plan(attn):
++    c = getattr(attn, "_geak_saplan", None)
++    if c is not None:
++        return c
++    c = False
++    try:
++        if (_GEAK_QKV and _GEAK_QKV2 and _GEAK_ROPE and _GEAK_RMS and _GEAK_FUSEQK
++                and _GEAK_TRITON_OK and not _GEAK_ROLLROPE and _GEAK_FASTFN
++                and type(attn.processor) is CosmosAttnProcessor2_0):
++            w = _geak_qkv_weight(attn)
++            op = _geak_out_params(attn)
++            if w is not False and op is not False:
++                D = w.shape[0] // (3 * attn.heads)
++                wqk, eps = _geak_qk_weight(attn, D)
++                if wqk is not False:
++                    c = (w, wqk, float(eps), op[0], op[1], int(attn.heads), int(D))
++    except Exception:
++        c = False
++    attn._geak_saplan = c
++    return c
++
++
++def _geak_crossattn_plan(attn):
++    c = getattr(attn, "_geak_caplan", None)
++    if c is not None:
++        return c
++    c = False
++    try:
++        if (_GEAK_RMS and _GEAK_TXTCACHE and _GEAK_FASTFN
++                and type(attn.processor) is CosmosAttnProcessor2_0):
++            lp = _geak_linear_params(attn.to_q)
++            op = _geak_out_params(attn)
++            nq = attn.norm_q
++            if (lp is not False and op is not False and getattr(nq, "weight", None) is not None
++                    and getattr(nq, "bias", None) is None
++                    and getattr(nq, "elementwise_affine", False) and hasattr(nq, "dim")):
++                c = (lp[0], lp[1], nq.weight, tuple(nq.dim), float(nq.eps),
++                     op[0], op[1], int(attn.heads))
++    except Exception:
++        c = False
++    attn._geak_caplan = c
++    return c
++
++
++def _geak_selfattn(attn, x, image_rotary_emb):
++    pl = _geak_selfattn_plan(attn)
++    if pl is False or image_rotary_emb is None:
++        return _geak_call_attn(attn, x, None, None, image_rotary_emb)
++    cos, sin = image_rotary_emb
++    B, S, _ = x.shape
++    H, D = pl[5], pl[6]
++    if not (cos.is_contiguous() and sin.is_contiguous()
++            and cos.shape == (S, D) and cos.dtype == torch.float32):
++        return _geak_call_attn(attn, x, None, None, image_rotary_emb)
++    t = F.linear(x, pl[0]).view(B, S, 3, H, D)
++    q, k = _geak_qkrope(t, pl[1], cos, sin, pl[2])
++    h = F.scaled_dot_product_attention(
++        q.transpose(1, 2), k.transpose(1, 2), t[:, :, 2].permute(0, 2, 1, 3),
++        attn_mask=None, dropout_p=0.0, is_causal=False,
++    )
++    return F.linear(h.transpose(1, 2).flatten(2, 3), pl[3], pl[4])
++
++
++def _geak_crossattn(attn, x, ehs, attention_mask):
++    pl = _geak_crossattn_plan(attn)
++    uid = getattr(ehs, "_geak_kv_uid", None)
++    cch = getattr(attn, "_geak_kv_cache", None)
++    if pl is False or uid is None or cch is None or cch[0] != uid:
++        return _geak_call_attn(attn, x, ehs, attention_mask, None)
++    B, S, _ = x.shape
++    q = F.linear(x, pl[0], pl[1]).unflatten(2, (pl[7], -1))
++    q = F.rms_norm(q, pl[3], pl[2], pl[4]).transpose(1, 2)
++    h = F.scaled_dot_product_attention(
++        q, cch[1], cch[2], attn_mask=attention_mask, dropout_p=0.0, is_causal=False,
++    )
++    return F.linear(h.transpose(1, 2).flatten(2, 3), pl[5], pl[6])
+ 
+ 
+ class CosmosTransformerBlock(nn.Module):
+@@ -286,6 +2032,119 @@
+ 
+         return hidden_states
+ 
++    # ------------------------------------------------------------------
++    # GEAK: compact-modulation block forward.
++    #
++    # `hidden_states` is carried as [B, T, HW, C] (a free view of the usual
++    # [B, THW, C]) and the AdaLN shift/scale/gate arrive PRECOMPUTED as
++    # [B, T, 1, C] broadcast tensors -- i.e. one row per distinct frame
++    # instead of 196 byte-identical copies per frame.  Mathematically this
++    # is exactly the stock path:
++    #     h*(1+scale) + shift   ==  addcmul(shift, h, one_plus_scale)
++    #     h + gate*attn         ==  addcmul(h, attn, gate)
++    # with `one_plus_scale` precomputed in bf16 exactly as `1 + scale` was.
++    # ------------------------------------------------------------------
++    def _geak_forward(
++        self,
++        hs4: torch.Tensor,
++        encoder_hidden_states: torch.Tensor,
++        m1,
++        m2,
++        m3,
++        image_rotary_emb=None,
++        extra_pos_emb4=None,
++        attention_mask=None,
++    ) -> torch.Tensor:
++        B, T, S, C = hs4.shape
++        if extra_pos_emb4 is not None:
++            hs4 = hs4 + extra_pos_emb4
++
++        # 1. Self Attention
++        nh = torch.addcmul(m1[0], self.norm1.norm(hs4), m1[1])
++        a = _geak_call_attn(self.attn1, nh.flatten(1, 2), None, None, image_rotary_emb)
++        hs4 = torch.addcmul(hs4, a.view(B, T, S, C), m1[2])
++
++        # 2. Cross Attention
++        nh = torch.addcmul(m2[0], self.norm2.norm(hs4), m2[1])
++        a = _geak_call_attn(self.attn2, nh.flatten(1, 2), encoder_hidden_states, attention_mask, None)
++        hs4 = torch.addcmul(hs4, a.view(B, T, S, C), m2[2])
++
++        # 3. Feed Forward
++        nh = torch.addcmul(m3[0], self.norm3.norm(hs4), m3[1])
++        f = _geak_ff(self.ff, nh.flatten(1, 2))
++        hs4 = torch.addcmul(hs4, f.view(B, T, S, C), m3[2])
++        return hs4
++
++    # ------------------------------------------------------------------
++    # GEAK_DIT_FUSELN block forward.  `nh` (already normalised + modulated)
++    # arrives from the PREVIOUS stage's fused kernel and the next stage's
++    # `nh` leaves with the residual, so the residual-add / LayerNorm /
++    # affine triple never touches HBM more than once.
++    # ------------------------------------------------------------------
++    def _geak_forward_fused(
++        self, hs4, nh, encoder_hidden_states, gate1, m2, m3, nxt,
++        image_rotary_emb, attention_mask, eps, nhq=None, fp8=None, nxt_q8=False,
++    ):
++        B, T, S, C = hs4.shape
++        # GEAK_DIT_FP8: (cross-q, feed-forward) eligibility for THIS block.  When
++        # a stage's consumer is an fp8 GEMM the add+LN kernel emits row-scaled
++        # fp8 directly and no bf16 `nh` is ever materialised.
++        _pc, _pf = fp8 if fp8 is not None else (False, False)
++
++        if nhq is not None:
++            _geak_q8_slot[0] = (nhq[0], nhq[1])
++            try:
++                a = _geak_call_attn(self.attn1, nhq[2], None, None, image_rotary_emb)
++            finally:
++                _geak_q8_slot[0] = None
++        elif _GEAK_FASTATT:
++            a = _geak_selfattn(self.attn1, nh.flatten(1, 2), image_rotary_emb)
++        else:
++            a = _geak_call_attn(self.attn1, nh.flatten(1, 2), None, None, image_rotary_emb)
++        if _pc:
++            hs4, nhq = _geak_add_ln_mod_q(hs4, a.view(B, T, S, C), gate1, m2[0], m2[1], eps)
++            nh = None
++        else:
++            hs4, nh = _geak_add_ln_mod(hs4, a.view(B, T, S, C), gate1, m2[0], m2[1], eps)
++            nhq = None
++
++        if nhq is not None:
++            _geak_q8_slot[0] = (nhq[0], nhq[1])
++            try:
++                a = _geak_call_attn(self.attn2, nhq[2], encoder_hidden_states,
++                                    attention_mask, None)
++            finally:
++                _geak_q8_slot[0] = None
++        elif _GEAK_FASTATT:
++            a = _geak_crossattn(self.attn2, nh.flatten(1, 2), encoder_hidden_states,
++                                attention_mask)
++        else:
++            a = _geak_call_attn(self.attn2, nh.flatten(1, 2), encoder_hidden_states,
++                                attention_mask, None)
++        if _pf:
++            hs4, nhq = _geak_add_ln_mod_q(hs4, a.view(B, T, S, C), m2[2], m3[0], m3[1], eps)
++            nh = None
++        else:
++            hs4, nh = _geak_add_ln_mod(hs4, a.view(B, T, S, C), m2[2], m3[0], m3[1], eps)
++            nhq = None
++
++        if nhq is not None:
++            f = _geak_ff_fp8(self.ff, nhq[0], nhq[1])
++        else:
++            f = _geak_ff(self.ff, nh.flatten(1, 2))
++        f = f.view(B, T, S, C)
++        if nxt is None:
++            hs4 = torch.addcmul(hs4, f, m3[2])
++            nh = None
++            nhq = None
++        elif nxt_q8:
++            hs4, nhq = _geak_add_ln_mod_q(hs4, f, m3[2], nxt[0], nxt[1], eps)
++            nh = None
++        else:
++            hs4, nh = _geak_add_ln_mod(hs4, f, m3[2], nxt[0], nxt[1], eps)
++            nhq = None
++        return hs4, nh, nhq
++
+ 
+ class CosmosRotaryPosEmbed(nn.Module):
+     def __init__(
+@@ -314,6 +2173,14 @@
+         batch_size, num_channels, num_frames, height, width = hidden_states.shape
+         pe_size = [num_frames // self.patch_size[0], height // self.patch_size[1], width // self.patch_size[2]]
+         device = hidden_states.device
++        # GEAK: the RoPE tables are a pure function of (pe_size, fps, device) -- ~20
++        # launches of arange/outer/repeat/cat/cos/sin rebuilt identically on every call.
++        _ck = None
++        if _GEAK_ROPE and _geak_memo_ok():
++            _ck = (tuple(pe_size), fps, str(device))
++            _hit = getattr(self, "_geak_cache", None)
++            if _hit is not None and _hit[0] == _ck:
++                return _hit[1], _hit[2]
+ 
+         h_theta = 10000.0 * self.h_ntk_factor
+         w_theta = 10000.0 * self.w_ntk_factor
+@@ -348,6 +2215,8 @@
+         freqs = torch.cat([emb_t, emb_h, emb_w] * 2, dim=-1).flatten(0, 2).float()
+         cos = torch.cos(freqs)
+         sin = torch.sin(freqs)
++        if _ck is not None:
++            self._geak_cache = (_ck, cos, sin)
+         return cos, sin
+ 
+ 
+@@ -373,6 +2242,14 @@
+         batch_size, num_channels, num_frames, height, width = hidden_states.shape
+         pe_size = [num_frames // self.patch_size[0], height // self.patch_size[1], width // self.patch_size[2]]
+ 
++        # GEAK: pure function of (batch, pe_size, dtype, device) and the frozen params.
++        _ck = None
++        if _GEAK_ROPE and _geak_memo_ok():
++            _ck = (batch_size, tuple(pe_size), hidden_states.dtype, str(hidden_states.device))
++            _hit = getattr(self, "_geak_cache", None)
++            if _hit is not None and _hit[0] == _ck:
++                return _hit[1]
++
+         emb_t = self.pos_emb_t[: pe_size[0]][None, :, None, None, :].repeat(batch_size, 1, pe_size[1], pe_size[2], 1)
+         emb_h = self.pos_emb_h[: pe_size[1]][None, None, :, None, :].repeat(batch_size, pe_size[0], 1, pe_size[2], 1)
+         emb_w = self.pos_emb_w[: pe_size[2]][None, None, None, :, :].repeat(batch_size, pe_size[0], pe_size[1], 1, 1)
+@@ -381,7 +2258,10 @@
+ 
+         norm = torch.linalg.vector_norm(emb, dim=-1, keepdim=True, dtype=torch.float32)
+         norm = torch.add(self.eps, norm, alpha=np.sqrt(norm.numel() / emb.numel()))
+-        return (emb / norm).type_as(hidden_states)
++        out = (emb / norm).type_as(hidden_states)
++        if _ck is not None:
++            self._geak_cache = (_ck, out)
++        return out
+ 
+ 
+ class CosmosTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+@@ -496,6 +2376,285 @@
+ 
+         self.gradient_checkpointing = False
+ 
++    # ------------------------------------------------------------------
++    # GEAK helpers
++    # ------------------------------------------------------------------
++    _geak_supports_stop_at_layer = True
++
++    def _geak_time_embed(self, hidden_states, timestep, key_tensor):
++        """`self.time_embed` memoised on the identity of the caller's timestep tensor."""
++        if not _GEAK_TEMB or not _geak_memo_ok():
++            return self.time_embed(hidden_states, timestep)
++        c = getattr(self, "_geak_temb_cache", None)
++        if (c is not None and c[0] is key_tensor and c[1] is hidden_states.dtype
++                and c[2] == hidden_states.device):
++            return c[3], c[4]
++        temb, et = self.time_embed(hidden_states, timestep)
++        # hold key_tensor: the identity key must not be able to outlive its object
++        self._geak_temb_cache = (key_tensor, hidden_states.dtype, hidden_states.device, temb, et)
++        if _GEAK_VERIFY:
++            print("[geak-verify] temb memo MISS shape=%s dtype=%s" %
++                  (tuple(temb.shape), temb.dtype), flush=True)
++        return temb, et
++
++    def _geak_no_block_hooks(self, last: int) -> bool:
++        """The fast path calls `block._geak_forward(...)` directly, bypassing
++        `nn.Module._call_impl` -- so it is only legal when nothing is listening
++        on the executing blocks via hooks."""
++        _mod = _geak_nnmod
++        if _mod._global_forward_hooks or _mod._global_forward_pre_hooks:
++            return False
++        blocks = self.transformer_blocks
++        for i in range(last + 1):
++            b = blocks[i]
++            if b._forward_hooks or b._forward_pre_hooks or b._backward_hooks:
++                return False
++        return True
++
++    def _geak_mod_weights(self, last: int, dtype, device):
++        """Stack the AdaLN LoRA weights of blocks 0..last into ONE [N*L, C] matrix
++        and ONE [N, L, 3C] batch, so all 3*(last+1) modulation units are produced by
++        a single mm + a single baddbmm instead of 2*3*(last+1) launch-floor GEMMs.
++        Cached; identical arithmetic, identical HBM traffic."""
++        c = getattr(self, "_geak_mod_w", None)
++        if c is not None and c[0] == last and (
++            c[1] is None or (c[1].dtype == dtype and c[1].device == device)
++        ):
++            return c[1], c[2]
++        norms = []
++        for i in range(last + 1):
++            b = self.transformer_blocks[i]
++            norms.extend((b.norm1, b.norm2, b.norm3))
++        for n in norms:
++            if not isinstance(n.linear_1, nn.Linear) or not isinstance(n.linear_2, nn.Linear):
++                self._geak_mod_w = (last, None, None)
++                return None, None
++            if n.linear_1.bias is not None or n.linear_2.bias is not None:
++                self._geak_mod_w = (last, None, None)
++                return None, None
++        w1 = torch.cat([n.linear_1.weight for n in norms], dim=0).to(dtype=dtype, device=device).contiguous()
++        w2 = torch.stack(
++            [n.linear_2.weight.t().contiguous() for n in norms], dim=0
++        ).to(dtype=dtype, device=device).contiguous()
++        self._geak_mod_w = (last, w1, w2)
++        return w1, w2
++
++    @torch.no_grad()
++    def _geak_verify(self, out, hidden_states, ehs, embedded_timestep, temb, image_rotary_emb,
++                     extra_pos_emb, attention_mask, last, B, T, H, W, ndim5):
++        for i in range(last + 1):
++            b = self.transformer_blocks[i]
++            for a in (b.attn1, b.attn2):
++                if hasattr(a, "_geak_kv_cache"):
++                    delattr(a, "_geak_kv_cache")
++        if ndim5:
++            t2, e2 = (
++                x.view(B, T, 1, 1, -1).expand(-1, -1, H, W, -1).flatten(1, 3)
++                for x in (temb, embedded_timestep)
++            )
++        else:
++            t2, e2 = temb, embedded_timestep
++        dbg = getattr(self, "_geak_dbg_mod", None)
++        if dbg is not None:
++            n0 = self.transformer_blocks[0].norm1
++            et = n0.linear_2(n0.linear_1(n0.activation(e2))) + t2
++            sr, cr, gr = et.chunk(3, dim=-1)
++            cr = cr + 1
++            mine = [x[0].expand(-1, -1, e2.shape[1] // max(T, 1), -1).reshape(sr.shape) for x in dbg]
++            for nm, a, b in (("shift", sr, mine[0]), ("1+scale", cr, mine[1]), ("gate", gr, mine[2])):
++                dd = (a.float() - b.float()).abs()
++                print(
++                    f"[geak-verify] unit0 {nm}: max|d|={dd.max().item():.4e} mean|d|={dd.mean().item():.4e} "
++                    f"mean|ref|={a.float().abs().mean().item():.4e} nbad={(dd > 0).sum().item()}/{dd.numel()}",
++                    flush=True,
++                )
++        ref = hidden_states
++        for i in range(last + 1):
++            ref = self.transformer_blocks[i](
++                hidden_states=ref, encoder_hidden_states=ehs, embedded_timestep=e2, temb=t2,
++                image_rotary_emb=image_rotary_emb, extra_pos_emb=extra_pos_emb,
++                attention_mask=attention_mask,
++            )
++        rf = ref.float()
++        df = (rf - out.float()).abs()
++        d = df.max().item()
++        n = rf.abs().max().item()
++        mrel = (df / (rf.abs() + 1e-3)).max().item()
++        print(
++            f"[geak-verify] blocks0..{last} max|d|={d:.4e} maxref={n:.4e} rel_of_max={d / (n + 1e-9):.3e} "
++            f"mean|d|={df.mean().item():.4e} mean|ref|={rf.abs().mean().item():.4e} "
++            f"max_elem_rel={mrel:.3e} ulp_at_max={d / (2.0 ** (torch.floor(torch.log2(torch.tensor(n))).item() - 8)):.2f}",
++            flush=True,
++        )
++
++    def _geak_run_blocks(
++        self,
++        hidden_states,
++        encoder_hidden_states,
++        embedded_timestep,
++        temb,
++        image_rotary_emb,
++        extra_pos_emb,
++        attention_mask,
++        last,
++        batch_size,
++        num_t,
++    ):
++        # GEAK_DIT_NOAC: see the header comment.  One context manager per CALL (not per
++        # block) removes 216 pure-dtype dispatches per iteration.  Autocast is a host-side
++        # dispatch key -- no device work, no sync, HIP-graph-capture safe.
++        if not _GEAK_NOAC:
++            return self._geak_run_blocks_impl(
++                hidden_states, encoder_hidden_states, embedded_timestep, temb,
++                image_rotary_emb, extra_pos_emb, attention_mask, last, batch_size, num_t,
++            )
++        with torch.autocast(device_type=hidden_states.device.type, enabled=False):
++            return self._geak_run_blocks_impl(
++                hidden_states, encoder_hidden_states, embedded_timestep, temb,
++                image_rotary_emb, extra_pos_emb, attention_mask, last, batch_size, num_t,
++            )
++
++    def _geak_run_blocks_impl(
++        self,
++        hidden_states,
++        encoder_hidden_states,
++        embedded_timestep,
++        temb,
++        image_rotary_emb,
++        extra_pos_emb,
++        attention_mask,
++        last,
++        batch_size,
++        num_t,
++    ):
++        B = batch_size
++        T = num_t
++        S = hidden_states.shape[1]
++        C = hidden_states.shape[2]
++        HW = S // T
++        nunits = 3 * (last + 1)
++
++        w1, w2 = self._geak_mod_weights(last, hidden_states.dtype, hidden_states.device)
++        L = w2.shape[1]
++
++        # SiLU once (the stock code runs it inside every one of the `nunits` AdaLN units
++        # on an input that is identical for all of them).
++        e = F.silu(embedded_timestep)                                  # [R, C]
++        h = F.linear(e, w1).view(-1, nunits, L).transpose(0, 1)        # [N, R, L]
++        m = torch.baddbmm(temb, h, w2)                                 # [N, R, 3C]  (+temb fused)
++        m = m.view(nunits, B, T, 3, C)
++        m[:, :, :, 1, :] += 1.0                                        # scale -> (1 + scale)
++        shifts = m[:, :, :, 0, :].unsqueeze(3).unbind(0)               # N x [B, T, 1, C]
++        scales = m[:, :, :, 1, :].unsqueeze(3).unbind(0)
++        gates = m[:, :, :, 2, :].unsqueeze(3).unbind(0)
++
++        if _GEAK_VERIFY:
++            self._geak_dbg_mod = (shifts, scales, gates)
++        hs4 = hidden_states.view(B, T, HW, C)
++        epe4 = None if extra_pos_emb is None else extra_pos_emb.view(B, T, HW, C)
++
++        blocks = self.transformer_blocks
++
++        # ---- GEAK_DIT_TUNABLE: measured GEMM selection, warmup calls only ----
++        _tun = _geak_tun_begin()
++        try:
++            return self._geak_block_loop(
++                blocks, hs4, encoder_hidden_states, shifts, scales, gates,
++                epe4, image_rotary_emb, attention_mask, last,
++            )
++        finally:
++            if _tun:
++                _geak_tun_end()
++
++    def _geak_fp8_setup(self, blocks, last, image_rotary_emb):
++        """Per-block (qkv, cross-q, ff) fp8 eligibility, resolved ONCE and cached.
++        Returns False when the lever is off or when the weights could not be
++        quantised outside a graph capture."""
++        c = getattr(self, "_geak_fp8_plans", None)
++        if c is not None:
++            return c
++        if not (_GEAK_FP8 and _GEAK_TRITON_OK and _GEAK_F8 is not None):
++            self._geak_fp8_plans = False
++            return False
++        try:
++            if torch.cuda.is_current_stream_capturing():
++                return False              # not cached: build it on an eager call
++        except Exception:
++            pass
++        # The fp8 QKV GEMM writes its result into the SAME `_t` the fused
++        # QKV/RoPE path consumes, so it is only eligible where that path is.
++        okq = (_GEAK_QKV and _GEAK_FASTFN and image_rotary_emb is not None)
++        plans = []
++        try:
++            for i in range(last + 1):
++                blk = blocks[i]
++                on = (_GEAK_FP8_L0 <= i <= _GEAK_FP8_L1)
++                pq = pc = pf = False
++                if on:
++                    if okq and "qkv" in _GEAK_FP8_OPS:
++                        w = _geak_qkv_weight(blk.attn1)
++                        if w is not False:
++                            pq = bool(_geak_fp8_w(blk.attn1, "_geak_f8qkv", w))
++                    if "cq" in _GEAK_FP8_OPS:
++                        lp = _geak_linear_params(blk.attn2.to_q)
++                        if lp is not False and lp[1] is None:
++                            pc = bool(_geak_fp8_w(blk.attn2, "_geak_f8q", lp[0]))
++                    if "ff" in _GEAK_FP8_OPS:
++                        fp = _geak_ff_params(blk.ff)
++                        if fp is not False and fp[1] is None and fp[3] is None:
++                            pf = (bool(_geak_fp8_w(blk.ff, "_geak_f8u", fp[0]))
++                                  and bool(_geak_fp8_w(blk.ff, "_geak_f8d", fp[2])))
++                plans.append((pq, pc, pf))
++        except Exception:
++            plans = None
++        if not plans or not any(any(p) for p in plans):
++            self._geak_fp8_plans = False
++            return False
++        self._geak_fp8_plans = plans
++        if _geak_fp8_seen[0] == 0:
++            _geak_fp8_seen[0] = 1
++            if _GEAK_VERIFY or _GEAK_FP8_ECHO:
++                print("[geak] FP8 LIVE: ops=%s blocks=%d plans[0]=%s plans[-1]=%s"
++                      % (sorted(_GEAK_FP8_OPS), len(plans), plans[0], plans[-1]),
++                      flush=True)
++        return plans
++
++    def _geak_block_loop(self, blocks, hs4, encoder_hidden_states, shifts, scales,
++                         gates, epe4, image_rotary_emb, attention_mask, last):
++        # ---- GEAK_DIT_FUSELN: one fused add+LN+affine kernel per stage ----
++        if epe4 is None and _geak_fuseln_ok(hs4, gates[0], shifts[0], scales[0]):
++            eps = float(blocks[0].norm1.norm.eps)
++            plans = self._geak_fp8_setup(blocks, last, image_rotary_emb)
++            nh = torch.addcmul(shifts[0], blocks[0].norm1.norm(hs4), scales[0])
++            nhq = None
++            for i in range(last + 1):
++                k = 3 * i
++                nxt = None if i == last else (shifts[k + 3], scales[k + 3])
++                _pl = plans[i] if plans else None
++                _nq = bool(plans[i + 1][0]) if (plans and i < last) else False
++                hs4, nh, nhq = blocks[i]._geak_forward_fused(
++                    hs4, nh, encoder_hidden_states, gates[k],
++                    (shifts[k + 1], scales[k + 1], gates[k + 1]),
++                    (shifts[k + 2], scales[k + 2], gates[k + 2]),
++                    nxt, image_rotary_emb, attention_mask, eps,
++                    nhq, None if _pl is None else _pl[1:], _nq,
++                )
++            return hs4.flatten(1, 2)
++
++        for i in range(last + 1):
++            k = 3 * i
++            hs4 = blocks[i]._geak_forward(
++                hs4,
++                encoder_hidden_states,
++                (shifts[k], scales[k], gates[k]),
++                (shifts[k + 1], scales[k + 1], gates[k + 1]),
++                (shifts[k + 2], scales[k + 2], gates[k + 2]),
++                image_rotary_emb,
++                epe4,
++                attention_mask,
++            )
++        return hs4.flatten(1, 2)
++
+     def forward(
+         self,
+         hidden_states: torch.Tensor,
+@@ -506,20 +2665,58 @@
+         condition_mask: Optional[torch.Tensor] = None,
+         padding_mask: Optional[torch.Tensor] = None,
+         return_dict: bool = True,
++        stop_at_layer: Optional[int] = None,
+     ) -> torch.Tensor:
+         batch_size, num_channels, num_frames, height, width = hidden_states.shape
+ 
+         # 1. Concatenate padding mask if needed & prepare attention mask
+-        if condition_mask is not None:
+-            hidden_states = torch.cat([hidden_states, condition_mask], dim=1)
+-
+-        if self.config.concat_padding_mask:
+-            padding_mask = transforms.functional.resize(
+-                padding_mask, list(hidden_states.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
+-            )
+-            hidden_states = torch.cat(
+-                [hidden_states, padding_mask.unsqueeze(2).repeat(batch_size, 1, num_frames, 1, 1)], dim=1
+-            )
++        _geak_packed = False
++        if (
++            _GEAK_PREPACK
++            and _geak_memo_ok()
++            and condition_mask is not None
++            and torch.is_tensor(padding_mask)
++            and bool(self.config.concat_padding_mask)
++            and condition_mask.dtype == hidden_states.dtype
++            and padding_mask.dtype == hidden_states.dtype
++            and hidden_states.is_contiguous()
++            and condition_mask.shape[0] == batch_size
++            and condition_mask.shape[2:] == hidden_states.shape[2:]
++        ):
++            _pk = (id(condition_mask), id(padding_mask), tuple(hidden_states.shape),
++                   hidden_states.dtype, str(hidden_states.device))
++            _pe = getattr(self, "_geak_pack_cache", None)
++            if _pe is None or _pe[0] != _pk:
++                _c0 = int(hidden_states.shape[1])
++                _cm_c = int(condition_mask.shape[1])
++                _pm = transforms.functional.resize(
++                    padding_mask, list(hidden_states.shape[-2:]),
++                    interpolation=transforms.InterpolationMode.NEAREST,
++                )
++                _pmr = _pm.unsqueeze(2).repeat(batch_size, 1, num_frames, 1, 1)
++                _buf = hidden_states.new_empty(
++                    (batch_size, _c0 + _cm_c + int(_pmr.shape[1]), num_frames) + tuple(hidden_states.shape[3:])
++                )
++                _buf[:, _c0:_c0 + _cm_c].copy_(condition_mask)
++                _buf[:, _c0 + _cm_c:].copy_(_pmr)
++                # hold the identity keys so they can never be recycled, and hold the
++                # buffer itself so a HIP graph capturing this replay has it pinned.
++                _pe = (_pk, _buf, _c0, condition_mask, padding_mask)
++                self._geak_pack_cache = _pe
++            _pe[1][:, :_pe[2]].copy_(hidden_states)
++            hidden_states = _pe[1]
++            _geak_packed = True
++        if not _geak_packed:
++            if condition_mask is not None:
++                hidden_states = torch.cat([hidden_states, condition_mask], dim=1)
++
++            if self.config.concat_padding_mask:
++                padding_mask = transforms.functional.resize(
++                    padding_mask, list(hidden_states.shape[-2:]), interpolation=transforms.InterpolationMode.NEAREST
++                )
++                hidden_states = torch.cat(
++                    [hidden_states, padding_mask.unsqueeze(2).repeat(batch_size, 1, num_frames, 1, 1)], dim=1
++                )
+ 
+         if attention_mask is not None:
+             attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, S]
+@@ -537,30 +2734,103 @@
+         hidden_states = self.patch_embed(hidden_states)
+         hidden_states = hidden_states.flatten(1, 3)  # [B, T, H, W, C] -> [B, THW, C]
+ 
++        # ---- GEAK: is the compact-modulation fast path eligible for this call? ----
++        _geak_last = None if stop_at_layer is None else int(stop_at_layer)
++        _geak_fast = (
++            _GEAK_ADALN
++            and _geak_last is not None
++            and 0 <= _geak_last < len(self.transformer_blocks)
++            and not (torch.is_grad_enabled() and self.gradient_checkpointing)
++            and self._geak_no_block_hooks(_geak_last)
++        )
++        if _geak_fast and self._geak_mod_weights(_geak_last, hidden_states.dtype, hidden_states.device)[0] is None:
++            _geak_fast = False
++
+         # 4. Timestep embeddings
++        timestep_ndim5 = timestep.ndim == 5
++        _geak_ts_key = timestep
+         if timestep.ndim == 1:
+-            temb, embedded_timestep = self.time_embed(hidden_states, timestep)
++            temb, embedded_timestep = self._geak_time_embed(hidden_states, timestep, _geak_ts_key)
+         elif timestep.ndim == 5:
+             assert timestep.shape == (batch_size, 1, num_frames, 1, 1), (
+                 f"Expected timestep to have shape [B, 1, T, 1, 1], but got {timestep.shape}"
+             )
+             timestep = timestep.flatten()
+-            temb, embedded_timestep = self.time_embed(hidden_states, timestep)
+-            # We can do this because num_frames == post_patch_num_frames, as p_t is 1
+-            temb, embedded_timestep = (
+-                x.view(batch_size, post_patch_num_frames, 1, 1, -1)
+-                .expand(-1, -1, post_patch_height, post_patch_width, -1)
+-                .flatten(1, 3)
+-                for x in (temb, embedded_timestep)
+-            )  # [BT, C] -> [B, T, 1, 1, C] -> [B, T, H, W, C] -> [B, THW, C]
++            temb, embedded_timestep = self._geak_time_embed(hidden_states, timestep, _geak_ts_key)
++            # GEAK: the stock code materialises [B, THW, C] / [B, THW, 3C] here by
++            # expanding B*T (=2) distinct rows over H*W (=196).  196 of every 197 rows
++            # are byte-identical, and all 54 live AdaLN units then push all 392 rows
++            # through SiLU -> Linear(2048->256) -> Linear(256->6144).  The fast path
++            # keeps the modulation at [B*T, *] and broadcasts it at the point of use.
++            if not _geak_fast:
++                # We can do this because num_frames == post_patch_num_frames, as p_t is 1
++                temb, embedded_timestep = (
++                    x.view(batch_size, post_patch_num_frames, 1, 1, -1)
++                    .expand(-1, -1, post_patch_height, post_patch_width, -1)
++                    .flatten(1, 3)
++                    for x in (temb, embedded_timestep)
++                )  # [BT, C] -> [B, T, 1, 1, C] -> [B, T, H, W, C] -> [B, THW, C]
+         else:
+             assert False
+ 
+         if self.config.use_crossattn_projection:
+-            encoder_hidden_states = self.crossattn_proj(encoder_hidden_states)
++            # GEAK: Linear(100352 -> 1024) + GELU over a (1, 512, 100352) tensor is a pure
++            # function of the prompt (~105 GFLOP + ~205 MB of weight read per call).  The
++            # prompt tensor carries `_geak_prompt_uid`, minted by the text-encoder cache in
++            # Cosmos25.encode_prompt, so a prompt change is a guaranteed miss.
++            _ehs_in = encoder_hidden_states
++            _p_uid = getattr(encoder_hidden_states, "_geak_prompt_uid", None) if _GEAK_TXTCACHE else None
++            if _p_uid is not None and getattr(self, "_geak_proj_uid", None) == _p_uid:
++                encoder_hidden_states = self._geak_proj_cache
++                if _GEAK_VERIFY:
++                    _r = self.crossattn_proj(_ehs_in)
++                    print(
++                        "[geak-verify] crossattn_proj max|d|="
++                        f"{(_r.float() - encoder_hidden_states.float()).abs().max().item():.3e}",
++                        flush=True,
++                    )
++            else:
++                encoder_hidden_states = self.crossattn_proj(encoder_hidden_states)
++                if _p_uid is not None:
++                    try:
++                        encoder_hidden_states._geak_kv_uid = _p_uid
++                    except Exception:
++                        _p_uid = None
++                    self._geak_proj_uid = _p_uid
++                    self._geak_proj_cache = encoder_hidden_states
++        elif _GEAK_TXTCACHE:
++            _p_uid = getattr(encoder_hidden_states, "_geak_prompt_uid", None)
++            if _p_uid is not None and getattr(encoder_hidden_states, "_geak_kv_uid", None) is None:
++                try:
++                    encoder_hidden_states._geak_kv_uid = _p_uid
++                except Exception:
++                    pass
++
++        # ---- GEAK fast path: explicit tail stop + compact AdaLN modulation ----
++        _last = len(self.transformer_blocks) - 1 if stop_at_layer is None else int(stop_at_layer)
++        if _geak_fast:
++            out = self._geak_run_blocks(
++                hidden_states,
++                encoder_hidden_states,
++                embedded_timestep,
++                temb,
++                image_rotary_emb,
++                extra_pos_emb,
++                attention_mask,
++                _last,
++                batch_size,
++                post_patch_num_frames if timestep_ndim5 else 1,
++            )
++            if _GEAK_VERIFY:
++                self._geak_verify(
++                    out, hidden_states, encoder_hidden_states, embedded_timestep, temb,
++                    image_rotary_emb, extra_pos_emb, attention_mask, _last, batch_size,
++                    post_patch_num_frames, post_patch_height, post_patch_width, timestep_ndim5,
++                )
++            return (out,) if not return_dict else Transformer2DModelOutput(sample=out)
+ 
+         # 5. Transformer blocks
+-        for block in self.transformer_blocks:
++        for _blk_i, block in enumerate(self.transformer_blocks):
+             if torch.is_grad_enabled() and self.gradient_checkpointing:
+                 hidden_states = self._gradient_checkpointing_func(
+                     block,
+@@ -582,6 +2852,8 @@
+                     extra_pos_emb=extra_pos_emb,
+                     attention_mask=attention_mask,
+                 )
++            if stop_at_layer is not None and _blk_i >= _last:
++                return (hidden_states,) if not return_dict else Transformer2DModelOutput(sample=hidden_states)
+ 
+         # 6. Output norm & projection & unpatchify
+         hidden_states = self.norm_out(hidden_states, embedded_timestep, temb)

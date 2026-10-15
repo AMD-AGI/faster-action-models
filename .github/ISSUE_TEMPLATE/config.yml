@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://www.amd.com/en/resources/product-security.html
+    about: Please report vulnerabilities privately to AMD PSIRT, not in public issues.

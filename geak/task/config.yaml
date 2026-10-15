@@ -1,0 +1,111 @@
+# GEAK task definition. Copy, point at your model, fill in the <PLACEHOLDERS>.
+#
+# NO MEASURED NUMBERS ARE COMMITTED HERE. The steer below is where a real
+# campaign puts its measured baseline, economics and dead ends -- fill those in
+# from YOUR run, and re-derive them every campaign, because the balance shifts
+# as work lands.
+
+# The editable surface. This decides what GEAK is ABLE to find: a lever in a file
+# not listed here is invisible to the optimizer. For an action model this should
+# usually span the denoise loop, the backbone, the observation encoder/VAE and
+# the inference entry point. Files inside site-packages are legitimate targets --
+# overlay a copy of the package and shadow it on PYTHONPATH.
+source_file_path:
+- src/<denoise_or_mot>.py
+- src/<backbone_or_video_dit>.py
+- src/<vae_or_encoder>.py
+- src/<action_head>.py
+
+# Advisory routing hints. Names GEAK should look at first; it is not limited to
+# these.
+target_kernel_functions:
+- <EntryPoint>.<inference_method>
+- <DenoiseModule>.forward
+- <Encoder>.encode
+- <AttentionOrBlock>.forward
+
+compile_command:
+- bash run_local.sh compile
+correctness_command:
+- bash run_local.sh correctness
+performance_command:
+- bash run_local.sh performance
+
+task_type: pytorch2pytorch
+
+prompt:
+  source_code: null
+  instructions: |
+    Optimize end-to-end <ENTRY_POINT> on <DEVICE / ARCH / TOOLCHAIN>. The
+    editable files are listed in source_file_path. The scored metric is the
+    geomean of the cases below, measured on the real model and real checkpoint:
+
+      <case_a>   <steps> denoise steps   (<why this case exists>)
+      <case_b>   <steps> denoise steps   (<why this case exists>)
+
+    MEASURED BASELINE (fill in from your own run, on this box, this session):
+      <case_a> : <...>
+      <case_b> : <...>
+      geomean  : <...>
+
+    *** STATE THE BAR AS AN ABSOLUTE, NOT A RATIO ***
+    If prior optimized work already exists for this model, give its measured
+    number here and say plainly that beating it is what counts as progress. A
+    campaign starting from a slower baseline can report a large ratio while
+    still being slower than what is already on disk.
+
+    *** THE ECONOMICS -- MEASURE THESE, DO NOT GUESS ***
+    Give the per-stage cost and what a millisecond in each stage is worth on the
+    scored metric, e.g. "1 ms of prologue is worth Ax; 1 ms/step of denoise is
+    worth Bx". This redirects effort better than any qualitative hint. RECOMPUTE
+    IT EVERY CAMPAIGN: the previous campaign's guidance goes stale as soon as its
+    own work lands, and inheriting it aims the next campaign at the weaker lane.
+
+    *** WHAT IS ALREADY IN THE TREE ***
+    List every lever already applied, so none is re-derived and none is broken.
+
+    *** DEAD ENDS -- WITH MECHANISM, NOT JUST NAMES ***
+    "Attempted, lost" invites a retry. "Lost because the region is at N% of
+    roofline and the dtype upcast eats the byte saving" does not. Record the
+    measured number and the reason for every closed direction.
+
+    *** HAZARDS THAT COST REAL SPEEDUP ELSEWHERE ***
+    1. ZERO GIT CONFLICT IS NOT EVIDENCE OF COMPOSITION. Patches can apply
+       cleanly to disjoint files and still be semantically broken -- compiling,
+       passing correctness, and silently disabling each other. When one patch
+       adds a custom op that re-launches another's kernel, diff the LAUNCH
+       CONFIGURATION, and treat every newly-added constexpr default as a
+       silent-fallback hazard.
+    2. SHIP KILL-SWITCHES AND VERIFY THE DEFAULT. Run the OFF arm and confirm it
+       reproduces the previous tree to several digits. A switch whose default was
+       never tested is not a switch: one campaign lost a direction to a kill
+       switch that shipped defaulting ON while its report claimed OFF.
+    3. When replacing an inductor-scheduled kernel, write the fake/meta kernel
+       FIRST -- declare exactly the layouts, aliasing and mutation the real one
+       performs -- and bisect with compile disabled before rewriting.
+
+    *** MEASUREMENT ***
+    Measure the run-to-run spread of the scored metric on the UNMODIFIED tree and
+    state it here; anything smaller must be re-measured interleaved
+    (for round: for arm) before being reported. Eager microbenchmarks
+    SYSTEMATICALLY OVERSTATE wins that will be realised inside torch.compile.
+    REGION profiles do not decide -- confirm on the full metric, because a region
+    win can be a full-stack regression.
+
+    *** CORRECTNESS: TWO GATES, BOTH MUST PASS ***
+    A numerics oracle is a cheap PRE-FILTER, not the authority. It replays one
+    input and is structurally blind to cross-episode state staleness -- which is
+    exactly what caching and graph capture introduce, and which has taken a model
+    from full success to zero while its oracle stayed green. The closed-loop
+    rollout is the authority.
+
+    If you cache or capture anything: the eval server reuses ONE model across
+    episodes with a new observation each time. Invalidate per episode by COUNTER,
+    never by data_ptr/_version identity -- the caching allocator hands back the
+    same addresses next episode, so identity-keyed invalidation silently serves
+    stale data. Never return a graph's internal static output buffer to the
+    caller; return a clone.
+
+    Keep fp32 accumulation. Custom Triton must be static-shape and guarded with
+    torch.compiler.is_compiling() fallbacks.
+  cheatsheet: null

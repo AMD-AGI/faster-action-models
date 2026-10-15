@@ -1,0 +1,13 @@
+# Default owner for all repository content.
+* @AMD-AGI/brain-genai
+
+# Repository governance and documentation, including this file.
+/.github/            @AMD-AGI/brain-genai
+/README.md           @AMD-AGI/brain-genai
+/CONTRIBUTING.md     @AMD-AGI/brain-genai
+/SECURITY.md         @AMD-AGI/brain-genai
+/LICENSE             @AMD-AGI/brain-genai
+/NOTICE              @AMD-AGI/brain-genai
+/THIRD_PARTY_NOTICES.md @AMD-AGI/brain-genai
+/.gitignore          @AMD-AGI/brain-genai
+/docs/               @AMD-AGI/brain-genai

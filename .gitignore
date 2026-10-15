@@ -47,7 +47,6 @@ nosetests.xml
 coverage.xml
 *.cover
 *.py.cover
-*.lcov
 .hypothesis/
 .pytest_cache/
 cover/
@@ -95,7 +94,7 @@ ipython_config.py
 #   install all needed dependencies.
 # Pipfile.lock
 
-# uv
+# UV
 #   Similar to Pipfile.lock, it is generally recommended to include uv.lock in version control.
 #   This is especially recommended for binary packages to ensure reproducibility, and is more
 #   commonly ignored for libraries.
@@ -123,14 +122,13 @@ ipython_config.py
 # pixi.lock
 #   Pixi creates a virtual environment in the .pixi directory, just like venv module creates one
 #   in the .venv directory. It is recommended not to include this directory in version control.
-.pixi/*
-!.pixi/config.toml
+.pixi
 
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
 
 # Celery stuff
-celerybeat-schedule*
+celerybeat-schedule
 celerybeat.pid
 
 # Redis
@@ -166,7 +164,7 @@ venv.bak/
 # Rope project settings
 .ropeproject
 
-# mkdocs/Zensical documentation
+# mkdocs documentation
 /site
 
 # mypy
@@ -197,10 +195,10 @@ cython_debug/
 .abstra/
 
 # Visual Studio Code
-#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore that
-#   can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
-#   and can be added to the global gitignore or merged into this file. However, if you prefer, you
-#   could uncomment the following to ignore the entire vscode folder
+#   Visual Studio Code specific template is maintained in a separate VisualStudioCode.gitignore 
+#   that can be found at https://github.com/github/gitignore/blob/main/Global/VisualStudioCode.gitignore
+#   and can be added to the global gitignore or merged into this file. However, if you prefer, 
+#   you could uncomment the following to ignore the entire vscode folder
 # .vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
@@ -218,3 +216,32 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# GEAK task and evaluation generated artifacts (keep task templates and configs tracked).
+/geak/task/src/*
+/geak/task/oracle_golden*.pt
+/eval/outputs/
+/eval/results/
+
+# DiT4DiT datasets, models, caches, and runtime outputs.
+/DiT4DiT/Cosmos-Predict2.5-2B/
+/DiT4DiT/dit4dit-model/
+/DiT4DiT/robocasa-gr1-tabletop-tasks/
+/DiT4DiT/playground/
+/DiT4DiT/results/
+/DiT4DiT/wandb/
+/DiT4DiT/**/*.pt
+/DiT4DiT/**/*.pth
+/DiT4DiT/**/*.safetensors
+
+# Side-by-side source trees under /src are SOURCE ONLY. The weight rules above
+# are anchored to /DiT4DiT/, so they do not reach here; without these a stray
+# checkpoint copied out of the 142 GB GEAK working directory would be committed.
+/src/**/*.pt
+/src/**/*.pth
+/src/**/*.safetensors
+/src/**/*.bin
+/src/**/*.ckpt
+/src/**/*.npz
+/src/**/*.pkl
+simulate/build-*/

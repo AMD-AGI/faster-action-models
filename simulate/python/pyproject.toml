@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "instinct-sim-python"
+version = "0.1.0"
+description = "Python layer of the GPU simulator: LIBERO and RoboCasa backends, MuJoCo-compatible env wrapper"
+requires-python = ">=3.10"
+# numpy only. The compiled `instinct_sim` extension is produced by the CMake build
+# (build/python/instinct_sim*.so) and is NOT a pip dependency. mujoco, robosuite,
+# LIBERO and RoboCasa come from the eval image that runs them.
+dependencies = ["numpy>=1.21"]
+
+[tool.setuptools]
+packages = ["instinct_sim_env", "instinct_sim_libero", "instinct_sim_robocasa"]
+py-modules = ["hip_env", "osc_controller", "instinct_sim_rt_mujoco", "instinct_sim_render_worker"]

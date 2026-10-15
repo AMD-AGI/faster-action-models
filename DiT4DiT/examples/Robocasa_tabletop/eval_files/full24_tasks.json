@@ -1,0 +1,242 @@
+[
+  {
+    "task_id": 0,
+    "family_id": 0,
+    "label": "bottle",
+    "dataset_name": "gr1_unified.PnPBottleToCabinetClose_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PnPBottleToCabinetClose_GR1ArmsAndWaistFourierHands_Env",
+    "source": "bottle",
+    "destination": "cabinet",
+    "group": "pnp6"
+  },
+  {
+    "task_id": 1,
+    "family_id": 1,
+    "label": "can",
+    "dataset_name": "gr1_unified.PnPCanToDrawerClose_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PnPCanToDrawerClose_GR1ArmsAndWaistFourierHands_Env",
+    "source": "can",
+    "destination": "drawer",
+    "group": "pnp6"
+  },
+  {
+    "task_id": 2,
+    "family_id": 2,
+    "label": "cup",
+    "dataset_name": "gr1_unified.PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PnPCupToDrawerClose_GR1ArmsAndWaistFourierHands_Env",
+    "source": "cup",
+    "destination": "drawer",
+    "group": "pnp6"
+  },
+  {
+    "task_id": 3,
+    "family_id": 3,
+    "label": "milk",
+    "dataset_name": "gr1_unified.PnPMilkToMicrowaveClose_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PnPMilkToMicrowaveClose_GR1ArmsAndWaistFourierHands_Env",
+    "source": "milk",
+    "destination": "microwave",
+    "group": "pnp6"
+  },
+  {
+    "task_id": 4,
+    "family_id": 4,
+    "label": "potato",
+    "dataset_name": "gr1_unified.PnPPotatoToMicrowaveClose_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PnPPotatoToMicrowaveClose_GR1ArmsAndWaistFourierHands_Env",
+    "source": "potato",
+    "destination": "microwave",
+    "group": "pnp6"
+  },
+  {
+    "task_id": 5,
+    "family_id": 5,
+    "label": "wine",
+    "dataset_name": "gr1_unified.PnPWineToCabinetClose_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PnPWineToCabinetClose_GR1ArmsAndWaistFourierHands_Env",
+    "source": "wine",
+    "destination": "cabinet",
+    "group": "pnp6"
+  },
+  {
+    "task_id": 6,
+    "family_id": 6,
+    "label": "cuttingboard_to_basket",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromCuttingboardToBasketSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromCuttingboardToBasketSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "cuttingboard",
+    "destination": "basket",
+    "group": "novel"
+  },
+  {
+    "task_id": 7,
+    "family_id": 7,
+    "label": "cuttingboard_to_cardboardbox",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromCuttingboardToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromCuttingboardToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "cuttingboard",
+    "destination": "cardboardbox",
+    "group": "novel"
+  },
+  {
+    "task_id": 8,
+    "family_id": 8,
+    "label": "cuttingboard_to_pan",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromCuttingboardToPanSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromCuttingboardToPanSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "cuttingboard",
+    "destination": "pan",
+    "group": "novel"
+  },
+  {
+    "task_id": 9,
+    "family_id": 9,
+    "label": "cuttingboard_to_pot",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromCuttingboardToPotSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromCuttingboardToPotSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "cuttingboard",
+    "destination": "pot",
+    "group": "novel"
+  },
+  {
+    "task_id": 10,
+    "family_id": 10,
+    "label": "cuttingboard_to_tieredbasket",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromCuttingboardToTieredbasketSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromCuttingboardToTieredbasketSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "cuttingboard",
+    "destination": "tieredbasket",
+    "group": "novel"
+  },
+  {
+    "task_id": 11,
+    "family_id": 11,
+    "label": "placemat_to_basket",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromPlacematToBasketSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromPlacematToBasketSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "placemat",
+    "destination": "basket",
+    "group": "novel"
+  },
+  {
+    "task_id": 12,
+    "family_id": 12,
+    "label": "placemat_to_bowl",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromPlacematToBowlSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromPlacematToBowlSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "placemat",
+    "destination": "bowl",
+    "group": "novel"
+  },
+  {
+    "task_id": 13,
+    "family_id": 13,
+    "label": "placemat_to_plate",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromPlacematToPlateSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromPlacematToPlateSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "placemat",
+    "destination": "plate",
+    "group": "novel"
+  },
+  {
+    "task_id": 14,
+    "family_id": 14,
+    "label": "placemat_to_tieredshelf",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromPlacematToTieredshelfSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromPlacematToTieredshelfSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "placemat",
+    "destination": "tieredshelf",
+    "group": "novel"
+  },
+  {
+    "task_id": 15,
+    "family_id": 15,
+    "label": "plate_to_bowl",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromPlateToBowlSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromPlateToBowlSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "plate",
+    "destination": "bowl",
+    "group": "novel"
+  },
+  {
+    "task_id": 16,
+    "family_id": 16,
+    "label": "plate_to_cardboardbox",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromPlateToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromPlateToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "plate",
+    "destination": "cardboardbox",
+    "group": "novel"
+  },
+  {
+    "task_id": 17,
+    "family_id": 17,
+    "label": "plate_to_pan",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromPlateToPanSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromPlateToPanSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "plate",
+    "destination": "pan",
+    "group": "novel"
+  },
+  {
+    "task_id": 18,
+    "family_id": 18,
+    "label": "plate_to_plate",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromPlateToPlateSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromPlateToPlateSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "plate",
+    "destination": "plate",
+    "group": "novel"
+  },
+  {
+    "task_id": 19,
+    "family_id": 19,
+    "label": "tray_to_cardboardbox",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromTrayToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromTrayToCardboardboxSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "tray",
+    "destination": "cardboardbox",
+    "group": "novel"
+  },
+  {
+    "task_id": 20,
+    "family_id": 20,
+    "label": "tray_to_plate",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromTrayToPlateSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromTrayToPlateSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "tray",
+    "destination": "plate",
+    "group": "novel"
+  },
+  {
+    "task_id": 21,
+    "family_id": 21,
+    "label": "tray_to_pot",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromTrayToPotSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromTrayToPotSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "tray",
+    "destination": "pot",
+    "group": "novel"
+  },
+  {
+    "task_id": 22,
+    "family_id": 22,
+    "label": "tray_to_tieredbasket",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromTrayToTieredbasketSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromTrayToTieredbasketSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "tray",
+    "destination": "tieredbasket",
+    "group": "novel"
+  },
+  {
+    "task_id": 23,
+    "family_id": 23,
+    "label": "tray_to_tieredshelf",
+    "dataset_name": "gr1_unified.PosttrainPnPNovelFromTrayToTieredshelfSplitA_GR1ArmsAndWaistFourierHands_1000",
+    "env_name": "gr1_unified/PosttrainPnPNovelFromTrayToTieredshelfSplitA_GR1ArmsAndWaistFourierHands_Env",
+    "source": "tray",
+    "destination": "tieredshelf",
+    "group": "novel"
+  }
+]
