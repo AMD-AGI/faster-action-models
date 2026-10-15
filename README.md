@@ -20,8 +20,9 @@ the tools to evaluate and reproduce the results:
   [DiT4DiT](https://github.com/Mondo-Robotics/DiT4DiT), plus fewer denoising
   steps, with the weights unchanged. [GEAK](https://www.amd.com/en/developer/resources/technical-articles/2026/geak-v4.html)
   is AMD's agentic GPU-kernel optimization framework.
-- **Compact Action Expert (CAE)**: a Compact Action DiT (hidden size 1024 -> 32)
-  that denoises continuous latents from an Action VAE. CAE-FastWAM (LIBERO,
+- **Compact Action Expert (CAE)**: two changes together, a smaller Action DiT
+  (hidden size 1024 -> 32) and an Action VAE whose continuous latents it
+  denoises. CAE-FastWAM (LIBERO,
   32x7 action chunk -> 8x16 latents) and CAE-DiT4DiT (RoboCasa-GR1, 16x29 ->
   8x48).
 - **Evaluation launchers** for LIBERO and RoboCasa-GR1 (24 task families), on

@@ -9,13 +9,13 @@ TASK="libero_uncond_2cam224_1e-4_32hdim_latent_K8d16_freebits_pernorm_joint"
 
 usage() {
   cat <<'EOF'
-Train Compact Action DiT in the FastWAM LIBERO K8/d16 latent space.
+Train the CAE-FastWAM Action DiT (hidden size 32) in the FastWAM LIBERO K8/d16 latent space.
 
 Usage:
   bash scripts/train_fastwam_libero_latent_policy.sh [hydra_overrides...]
 
 Required environment:
-  COMPACT_INIT_CHECKPOINT  Compact Action DiT initializer
+  COMPACT_INIT_CHECKPOINT  32-dimensional Action DiT initializer
   K8D16_VAE_CHECKPOINT    Trained K8/d16 Action VAE
 
 Optional environment:

@@ -17,7 +17,7 @@ TRAINING_SCRIPTS = {
     "FastWAM LIBERO K8/d16 Action VAE": (
         ROOT / "scripts" / "train_fastwam_libero_action_vae.sh"
     ),
-    "Compact Action DiT": (
+    "CAE-FastWAM Action DiT": (
         ROOT / "scripts" / "train_fastwam_libero_latent_policy.sh"
     ),
     "DiT4DiT RoboCasa full-24 K8/d48 Action VAE": (

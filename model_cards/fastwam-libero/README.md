@@ -29,12 +29,12 @@ the full write-up and results are in the
 
 ## Model
 
-CAE-FastWAM (Compact Action Expert: the 32-hidden-dimension Compact Action DiT with the
-K8 x d16 Action VAE, GEAK-optimized) is one model with two parts:
+CAE-FastWAM is FastWAM with the Compact Action Expert (CAE), GEAK-optimized. The
+CAE combines two changes:
 
 | Component | Description |
 |---|---|
-| Compact Action DiT | Hidden size reduced from 1024 to 32 (about 30M action-expert parameters); denoises latent action chunks |
+| Action DiT | Hidden size reduced from 1024 to 32 (about 30M action-expert parameters); denoises latent action chunks |
 | K8 x d16 Action VAE | Suite-conditioned; encodes each 32 x 7 action chunk as 8 latent tokens of width 16 |
 
 The evaluation protocol is described in

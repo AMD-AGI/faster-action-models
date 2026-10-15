@@ -15,7 +15,7 @@ data is CC BY 4.0.
 The **Compact Action Expert** is one model that combines two architecture
 changes:
 
-1. **Compact Action DiT.** The action expert is reduced to a 32-dimensional
+1. **Smaller Action DiT.** The action expert is reduced to a 32-dimensional
    hidden state (about 30M parameters).
 2. **K8 x d16 Action VAE.** A suite-conditioned action VAE compresses each
    32-step action chunk into 8 tokens with 16 dimensions per token, and the
@@ -53,7 +53,7 @@ below). Export `MUJOCO_GL=egl` or `MUJOCO_GL=osmesa` to force one.
 The examples expect `LATENT_FASTWAM_CHECKPOINT`, `K8D16_VAE_CHECKPOINT`, and
 `PER_SUITE_STATS_DIR` to point to the downloaded model-zoo assets.
 
-## Initialize the Compact Action DiT
+## Initialize the 32-dimensional Action DiT
 
 Initialize the 32-dimensional action expert from the video DiT; Compact Action
 Expert training below starts from this initializer:

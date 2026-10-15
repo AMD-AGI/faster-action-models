@@ -13,7 +13,7 @@ scripts and guide in [`docs/cae-dit4dit-robocasa.md`](docs/cae-dit4dit-robocasa.
 
 | Checkpoint | License | Model card |
 |---|---|---|
-| CAE-FastWAM LIBERO (Compact Action DiT and K8 x d16 Action VAE) | Apache-2.0; contains a modified version of Wan2.2-TI2V-5B | [`model_cards/fastwam-libero/`](model_cards/fastwam-libero/) |
+| CAE-FastWAM LIBERO (32-hidden-dimension Action DiT and K8 x d16 Action VAE) | Apache-2.0; contains a modified version of Wan2.2-TI2V-5B | [`model_cards/fastwam-libero/`](model_cards/fastwam-libero/) |
 
 The Hugging Face repository ships the `LICENSE`, `NOTICE`, and `README.md`
 from the model-card directory. Third-party models, datasets, and simulator
@@ -39,12 +39,12 @@ reorganization is required after download.
 
 ## CAE-FastWAM
 
-CAE-FastWAM (Compact Action Expert: the 32-hidden-dimension Compact Action DiT with the
-K8 x d16 Action VAE, GEAK-optimized) is one model with two parts: a Compact Action DiT whose
-hidden dimension is reduced to 32 (about 30M action-expert parameters), and a
-suite-conditioned variational Action VAE that compresses each `[32, 7]` action
-chunk into 8 tokens with 16 dimensions per token (K8 x d16). The Compact Action DiT
-denoises in that latent space.
+CAE-FastWAM is FastWAM with the Compact Action Expert (CAE), GEAK-optimized. The
+CAE combines two changes: an Action DiT whose hidden dimension is reduced from
+1024 to 32 (about 30M action-expert parameters), and a suite-conditioned
+variational Action VAE that compresses each `[32, 7]` action chunk into 8 tokens
+with 16 dimensions per token (K8 x d16). The Action DiT denoises in that latent
+space.
 
 - Evaluation: the four LIBERO suites, 50 episodes per task.
 - Action scheduler: `train_shift=5.0`, `infer_shift=5.0`.
