@@ -118,6 +118,11 @@ DETERMINISM
   bit-reproducible across GPU models and software versions, so elsewhere a
   rerun can differ in a few episodes.
 
+Where to run it: the ROCm environments DiT4DiT/environments/setup_dit4dit_rocm_envs.sh
+builds use the evaluation image's site-packages, so run this launcher inside
+that image: bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_robocasa.sh ...
+(docs/side-by-side-source-trees.md, "DiT4DiT Python environments on ROCm").
+
 Required environment:
   DIT4DIT_ROBOCASA_CKPT  Policy checkpoint for the selected arm (see --arm).
                          baseline/geak: the DiT4DiT authors' checkpoint,

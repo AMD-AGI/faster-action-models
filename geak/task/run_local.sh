@@ -71,10 +71,12 @@ if [[ -n "${FWE_CONFIG_DIR:-}" ]]; then
 fi
 
 PW="/tmp/ctr_passwd_$(id -u)"
-if ! getent passwd "$(id -u)" > "$PW" 2>/dev/null; then
+# written to a private file, then renamed: other tools write the same file concurrently
+if ! getent passwd "$(id -u)" > "$PW.$$" 2>/dev/null; then
   printf 'geak:x:%s:%s:GEAK user:%s:/bin/bash\n' \
-    "$(id -u)" "$(id -g)" "${HOME:-/tmp}" > "$PW"
+    "$(id -u)" "$(id -g)" "${HOME:-/tmp}" > "$PW.$$"
 fi
+mv -f "$PW.$$" "$PW"
 RG="$(getent group render | cut -d: -f3 || true)"; RG="${RG:-109}"
 VG="$(getent group video | cut -d: -f3 || true)";  VG="${VG:-44}"
 # Container HOME: use the caller's when usable, else a per-uid /tmp dir. Hard-

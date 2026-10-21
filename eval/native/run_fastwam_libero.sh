@@ -185,7 +185,7 @@ has_results=0
 compgen -G "$OUT/*/gpu*_task*_results.json" >/dev/null && has_results=1
 eval_claim_run_dir "$OUT/.run_identity" "$(printf '%s\n' "${identity[@]}")" "$has_results" || exit 2
 
-PW="/tmp/ctr_passwd_$(id -u)"; getent passwd "$(id -u)" > "$PW" || true
+PW="/tmp/ctr_passwd_$(id -u)"; getent passwd "$(id -u)" > "$PW.$$" || true; mv -f "$PW.$$" "$PW"  # atomic: shared file
 RG="$(getent group render | cut -d: -f3 || true)"; VG="$(getent group video | cut -d: -f3 || true)"
 HP="$ROOT/simulate/python"
 DOCKER=(docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt seccomp=unconfined

@@ -205,10 +205,27 @@ def _passwd_file() -> str:
     return f"/tmp/ctr_passwd_{os.getuid()}"
 
 
+def _write_passwd(path: str) -> None:
+    """The invoking user's passwd entry, written atomically: other tools write the same file."""
+    tmp = f"{path}.{os.getpid()}"
+    with open(tmp, "w") as f:
+        subprocess.run(["getent", "passwd", str(os.getuid())], stdout=f, check=False)
+    os.replace(tmp, path)
+
+
+_CONTAINERS = [0]
+
+
+def _container_name() -> str:
+    """A recognizable, unique name for each container this run starts."""
+    _CONTAINERS[0] += 1
+    return f"dit4dit_latency_{os.getuid()}_{os.getpid()}_{_CONTAINERS[0]}"
+
+
 def _container_base(env: dict, work: str, mounts: dict, gpu_devices: bool) -> list[str]:
     """`docker run` flags shared by the overlay build and the timed cells."""
     uid, gid = os.getuid(), os.getgid()
-    args = ["docker", "run", "--rm"]
+    args = ["docker", "run", "--rm", "--name", _container_name()]
     if gpu_devices:
         args += ["--device=/dev/kfd", "--device=/dev/dri", "--security-opt", "seccomp=unconfined",
                  "--group-add", _gid_of("video", "44"), "--group-add", _gid_of("render", "109")]
@@ -283,8 +300,7 @@ def docker_argv(name: str, steps: int, gpu: str, env: dict, work: str, ckpt: str
 
 def prepare_host(env: dict, work: str, names) -> None:
     """Side effects the container commands rely on."""
-    with open(_passwd_file(), "w") as f:
-        subprocess.run(["getent", "passwd", str(os.getuid())], stdout=f, check=False)
+    _write_passwd(_passwd_file())
     os.makedirs(os.path.join(work, "home"), exist_ok=True)
     for n in names:
         os.makedirs(f"{cache_root(work, n)}/inductor", exist_ok=True)

@@ -30,8 +30,8 @@ is a venv on the same interpreter. So build both presets against that image:
 docker build -f docker/Dockerfile.eval -t fam-eval:rocm7.14 .
 # build image = the sim client image + rocm-sdk-devel + pybind11 (the run image itself is not modified)
 docker build -f simulate/docker/Dockerfile.build --build-arg BASE=fam-eval:rocm7.14 -t instinct-sim-build simulate/docker
-docker run --rm -v "$PWD:$PWD" -w "$PWD" instinct-sim-build bash simulate/build.sh libero   build/instinct-sim-libero
-docker run --rm -v "$PWD:$PWD" -w "$PWD" instinct-sim-build bash simulate/build.sh robocasa build/instinct-sim-robocasa
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:$PWD" -w "$PWD" instinct-sim-build bash simulate/build.sh libero   build/instinct-sim-libero
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:$PWD" -w "$PWD" instinct-sim-build bash simulate/build.sh robocasa build/instinct-sim-robocasa
 ```
 
 The two presets are the exact flags used for the evaluations (`PROVENANCE.md`). `HIP_ARCH` overrides the GPU

@@ -56,6 +56,15 @@ former --gpu still works with a deprecation warning.
 EVAL_DOCKER_ARGS adds `docker run` flags to every timed container, e.g.
 EVAL_DOCKER_ARGS="--cpuset-cpus 104-127" pins it to the CPUs of the GPU's NUMA node
 (the reference latency runs pinned each container that way, away from other work).
+
+ENVIRONMENT (geak/task/run_local.sh, which runs each cell)
+  required  EVAL_IMAGE        the evaluation image (docker/Dockerfile.eval)
+            MODEL_SRC_ROOT    a FastWAM checkout (this repository's FastWAM/)
+            MODEL_CKPT        FastWAM checkpoint (yuanty/fastwam libero_uncond_2cam224.pt)
+            DATASET_STATS     its statistics (libero_uncond_2cam224_dataset_stats.json)
+            HF_CACHE_DIR      an existing writable cache directory on the host
+            MODEL_PYTHON      the image's Python (/opt/venv/bin/python3)
+  optional  DIFFSYNTH_MODEL_BASE_PATH  the Wan-AI files (MODEL_ZOO.md; default HF_CACHE_DIR)
 """
 from __future__ import annotations
 
@@ -197,7 +206,9 @@ def measure(label: str, arm: str, steps: int, gpu: str, task_dir: str,
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__.split("\n", 1)[1])
     ap.add_argument("--arms", default="eager,compile,geak")
     ap.add_argument("--steps", type=int, default=10)
     ap.add_argument("--reduced-steps", type=int, default=2,

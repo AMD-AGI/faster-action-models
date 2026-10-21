@@ -391,7 +391,7 @@ bash eval/native/run_fastwam_libero.sh --arm cae --steps 4 --gpus 7 --full
 
 ### DiT4DiT Python environments on ROCm
 
-The DiT4DiT launchers run on the host and take their Python environments as
+The DiT4DiT launchers take their Python environments as
 variables (`DIT4DIT_MODEL_PYTHON`, `DIT4DIT_LIBERO_PYTHON`, `ROBOCASA_PYTHON`,
 `DIT4DIT_PYOVERLAY`). `DiT4DiT/requirements.txt` cannot be installed on AMD as
 written: it pins CUDA `torch==2.7.0`, `triton` and 15 `nvidia-*` wheels.
@@ -402,8 +402,8 @@ builds all of them inside the evaluation image
 ```bash
 docker build -f docker/Dockerfile.eval -t fam-eval:rocm7.14 .
 bash DiT4DiT/environments/setup_robocasa_gr1.sh          # RoboCasa only: pinned, patched checkout
-docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:$PWD" -w "$PWD" fam-eval:rocm7.14 \
-  bash DiT4DiT/environments/setup_dit4dit_rocm_envs.sh "$PWD/envs"
+export EVAL_IMAGE=fam-eval:rocm7.14
+bash scripts/in_eval_image.sh bash DiT4DiT/environments/setup_dit4dit_rocm_envs.sh "$PWD/envs"
 ```
 
 - The model environment is a venv that sees the image's site-packages, with
@@ -422,16 +422,31 @@ docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:$PWD" -w "$PWD"
   `download_kitchen_assets.py` and `download_groot_assets.py` (see
   [`cae-dit4dit-robocasa.md`](cae-dit4dit-robocasa.md#environment)).
 
-The environments use the image's site-packages, so run the DiT4DiT launchers
-inside the same image, with the GPU devices and the repository mounted at its
-own path. The script prints the variables to export.
+`scripts/in_eval_image.sh` runs a command in `EVAL_IMAGE` as the invoking user
+(with a passwd entry and `USER`, so builds that call `getpass` work for any host
+uid), with every GPU, the host network and IPC namespace, `/tmp`, the repository
+at its own path and the paths the forwarded variables name (`--help` lists
+them). The environments use the image's site-packages, so the DiT4DiT launchers
+run inside the same image through it: prefix each command below with
+`bash scripts/in_eval_image.sh`, for example
+
+```bash
+bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_libero.sh --arm baseline --steps 4 --gpus 0 --smoke
+```
+
+The reproduction scripts (`scripts/reproduce_*.sh`, `scripts/run_all_evals.sh`)
+do this for every DiT4DiT launch, so they run from the host. The setup script
+prints the variables to export (the interpreter paths are the ones inside the
+image). An environment built before `pydantic` was added to the RoboCasa client
+environment fails every RoboCasa client at `from pydantic import BaseModel`:
+rerun the script.
 
 ### DiT4DiT LIBERO
 
 ```bash
 export DIT4DIT_LIBERO_CKPT=/path/to/dit4dit-model/dit4dit_libero/final_model/pytorch_model.pt   # mondo-robotics/dit4dit-model
-export DIT4DIT_MODEL_PYTHON=/path/to/model/venv/bin/python
-export DIT4DIT_LIBERO_PYTHON=/path/to/libero/venv/bin/python
+export DIT4DIT_MODEL_PYTHON=$PWD/envs/model/bin/python    # printed by setup_dit4dit_rocm_envs.sh
+export DIT4DIT_LIBERO_PYTHON=/opt/venv/bin/python3         # the image's own python3
 export LIBERO_ROOT=/path/to/LIBERO
 export DIT4DIT_PYOVERLAY=/path/to/pyoverlay
 ```
@@ -441,13 +456,13 @@ diffusers, which must be unmodified 3996788).
 
 ```bash
 # 6  DiT4DiT baseline, 4 step
-bash scripts/eval_dit4dit_libero.sh --arm baseline --steps 4 --gpus 0 --port 5694 --full
+bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_libero.sh --arm baseline --steps 4 --gpus 0 --port 5694 --full
 
 # 7  DiT4DiT GEAK, 4 step
-bash scripts/eval_dit4dit_libero.sh --arm geak --steps 4 --gpus 1 --port 5695 --full
+bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_libero.sh --arm geak --steps 4 --gpus 1 --port 5695 --full
 
 # 8  DiT4DiT GEAK, 2 step   (--arm baseline likewise)
-bash scripts/eval_dit4dit_libero.sh --arm geak --steps 2 --gpus 5 --port 5696 --full
+bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_libero.sh --arm geak --steps 2 --gpus 5 --port 5696 --full
 ```
 
 ### DiT4DiT RoboCasa-GR1 full-24
@@ -464,20 +479,20 @@ arms.
 export DIT4DIT_ROBOCASA_CKPT=/path/to/dit4dit-model/dit4dit_robocasa_gr1/final_model/pytorch_model.pt  # baseline/geak; --arm cae: your own CAE-DiT4DiT checkpoint
 export ROBOSUITE_OVERLAY=/path/to/robosuite151/site-packages
 export ROBOCASA_ROOT=/path/to/robocasa-gr1-tabletop-tasks  # deterministic-reset patch applied
-export DIT4DIT_MODEL_PYTHON=/path/to/model/venv/bin/python
-export ROBOCASA_PYTHON=/path/to/robocasa/venv/bin/python
+export DIT4DIT_MODEL_PYTHON=$PWD/envs/model/bin/python    # printed by setup_dit4dit_rocm_envs.sh
+export ROBOCASA_PYTHON=$PWD/envs/robocasa/bin/python
 export DIT4DIT_PYOVERLAY=/path/to/pyoverlay
 ```
 
 ```bash
 # 9  RoboCasa baseline, 4 step  (DiT4DiT authors' RoboCasa-GR1 checkpoint)
-bash scripts/eval_dit4dit_robocasa.sh --arm baseline --steps 4 --gpus 0,1,2,3,4,5 --full
+bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_robocasa.sh --arm baseline --steps 4 --gpus 0,1,2,3,4,5 --full
 
 # 10 RoboCasa GEAK, 4 step  (--steps 2 likewise)
-bash scripts/eval_dit4dit_robocasa.sh --arm geak --steps 4 --gpus 0,1,2,3,4,5 --full
+bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_robocasa.sh --arm geak --steps 4 --gpus 0,1,2,3,4,5 --full
 
 # 11 CAE-DiT4DiT (K8 x d48 latent policy, 200K-step checkpoint you train)
-bash scripts/eval_dit4dit_robocasa.sh --arm cae --gpus 0,1,2,3,4,5 --full
+bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_robocasa.sh --arm cae --gpus 0,1,2,3,4,5 --full
 ```
 
 The baseline/geak servers start through
@@ -573,8 +588,8 @@ same overlay as well. `scripts/dit4dit_latency.py` refuses a cell whose imported
 as `EVAL_IMAGE`, two variables give it the DiT4DiT model environment:
 
 ```bash
-# inside the image, next to the environments setup_dit4dit_rocm_envs.sh built under envs/
-pip install --no-deps --target envs/d4pins transformers==4.57.6 tokenizers==0.22.2
+# next to the environments setup_dit4dit_rocm_envs.sh built under envs/
+bash scripts/in_eval_image.sh pip install --no-deps --target envs/d4pins transformers==4.57.6 tokenizers==0.22.2
 export DIT4DIT_DIFFUSERS_SRC=$PWD/envs/model/lib/python3.12/site-packages/diffusers   # diffusers 3996788
 export DIT4DIT_PYOVERLAY=$PWD/envs/pyoverlay:$PWD/envs/d4pins
 ```

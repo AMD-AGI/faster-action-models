@@ -169,11 +169,23 @@ speeds up data loading.
 
 Training runs in the evaluation image ([`docker/Dockerfile.eval`](../docker/Dockerfile.eval))
 plus a small overlay. Do not install `pyproject.toml`'s dependencies on ROCm:
-they pin CUDA builds of PyTorch. Inside the image:
+they pin CUDA builds of PyTorch. Inside the image, from `FastWAM/` (as root, or
+build a derived image with these lines):
 
 ```bash
 apt-get install -y --no-install-recommends ffmpeg
 pip install -r ../docker/requirements-fastwam-train.txt
+pip install -e . --no-deps    # the fastwam package itself; without it: No module named 'fastwam'
+```
+
+Start the training container with the GPUs, the repository and the data
+mounted, and with the host IPC namespace (or a large `--shm-size`): the data
+loader workers share batches through `/dev/shm`, and the 64 MB docker default
+fails with `unable to allocate shared memory(shm)`:
+
+```bash
+docker run --rm -it --device=/dev/kfd --device=/dev/dri --group-add video --group-add render \
+  --ipc=host --security-opt seccomp=unconfined -v "$PWD:$PWD" -w "$PWD/FastWAM" <training-image>
 ```
 
 The overlay adds DeepSpeed, which `scripts/train_zero1.sh` launches through

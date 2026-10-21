@@ -117,6 +117,11 @@ HOW --steps IS PLUMBED
   interpolates the step count, so a silent override failure would mislabel the
   artifact; the read-back assertion is what makes that impossible.
 
+Where to run it: the ROCm environments DiT4DiT/environments/setup_dit4dit_rocm_envs.sh
+builds use the evaluation image's site-packages, so run this launcher inside
+that image: bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_libero.sh ...
+(docs/side-by-side-source-trees.md, "DiT4DiT Python environments on ROCm").
+
 Required environment:
   DIT4DIT_LIBERO_CKPT    DiT4DiT LIBERO checkpoint: mondo-robotics/dit4dit-model
                          dit4dit_libero/final_model/pytorch_model.pt. The

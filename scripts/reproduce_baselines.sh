@@ -16,6 +16,9 @@
 #                                                dit4dit_libero/final_model/pytorch_model.pt
 #   DIT4DIT_ROBOCASA_CKPT                         the DiT4DiT authors' RoboCasa-GR1 checkpoint: mondo-robotics/dit4dit-model
 #                                                dit4dit_robocasa_gr1/final_model/pytorch_model.pt
+#   DIT4DIT_MODEL_PYTHON, DIT4DIT_PYOVERLAY       the DiT4DiT environments DiT4DiT/environments/setup_dit4dit_rocm_envs.sh
+#   DIT4DIT_LIBERO_PYTHON, ROBOCASA_PYTHON        builds and prints (interpreters inside EVAL_IMAGE; DIT4DIT_PYTHON sets
+#                                                any of the three Pythons left unset); docs/side-by-side-source-trees.md
 #
 # Runtime, approximate, per configuration on one AMD Instinct™ MI355X node (measured on our runs):
 #   FastWAM LIBERO --full (2,000 episodes), FastWAM's own evaluator, one worker per GPU in EVAL_GPUS (default 0):
@@ -28,6 +31,10 @@
 # The FastWAM runs use eval/native/run_fastwam_libero.sh, FastWAM's own evaluator under the repository protocol
 # (eval/PROTOCOL.md).
 #
+# Where the runs execute: start the script on the host (it needs docker). FastWAM runs in EVAL_IMAGE containers
+# the launcher starts; each DiT4DiT launch runs inside EVAL_IMAGE through scripts/in_eval_image.sh. A DiT4DiT
+# LIBERO launch takes the first GPU of EVAL_GPUS (one policy server); RoboCasa runs one server per listed GPU.
+#
 # Flags: --help, --dry-run (print every resolved run without assets), --smoke (1 trial per task and one latency
 # round with the real checkpoints, under <default>-smoke), --only REGEX (only the launches whose command line
 # matches), --check (check the environment only).
@@ -38,7 +45,7 @@ cd "$(dirname "$SELF")/.."
 # shellcheck source=scripts/reproduce_common.sh
 source scripts/reproduce_common.sh
 repro_init "$SELF" "$@"
-repro_require EVAL_IMAGE LIBERO_ROOT FASTWAM_CKPT FASTWAM_DATASET_STATS DIT4DIT_LIBERO_CKPT DIT4DIT_ROBOCASA_CKPT ROBOSUITE_OVERLAY
+repro_require EVAL_IMAGE LIBERO_ROOT FASTWAM_CKPT FASTWAM_DATASET_STATS DIT4DIT_LIBERO_CKPT DIT4DIT_ROBOCASA_CKPT ROBOSUITE_OVERLAY DIT4DIT_PYOVERLAY "DIT4DIT_MODEL_PYTHON|DIT4DIT_PYTHON" "DIT4DIT_LIBERO_PYTHON|DIT4DIT_PYTHON" "ROBOCASA_PYTHON|DIT4DIT_PYTHON"
 R="$(repro_dir eval/outputs/reproduce_baselines)"
 mkdir -p "$R"
 
@@ -49,9 +56,9 @@ fastwam run bash eval/native/run_fastwam_libero.sh --sim mujoco --arm baseline -
 # fastwam run bash eval/native/run_fastwam_libero.sh --sim instinct --arm baseline --full --output-dir "$R/fastwam-libero-baseline-10step-instinct"
 
 # DiT4DiT LIBERO, baseline (upstream DiT4DiT), 4 steps
-run bash scripts/eval_dit4dit_libero.sh --sim mujoco --arm baseline --steps 4 --full --output-dir "$R/dit4dit-libero-baseline-4step-mujoco"
-# run bash scripts/eval_dit4dit_libero.sh --sim instinct --arm baseline --steps 4 --full --output-dir "$R/dit4dit-libero-baseline-4step-instinct"
+dit4dit run bash scripts/eval_dit4dit_libero.sh --sim mujoco --arm baseline --steps 4 --full --output-dir "$R/dit4dit-libero-baseline-4step-mujoco"
+# dit4dit run bash scripts/eval_dit4dit_libero.sh --sim instinct --arm baseline --steps 4 --full --output-dir "$R/dit4dit-libero-baseline-4step-instinct"
 
 # DiT4DiT RoboCasa-GR1 full-24, baseline (upstream DiT4DiT), 4 steps
-run bash scripts/eval_dit4dit_robocasa.sh --sim mujoco --arm baseline --steps 4 --full --output-dir "$R/dit4dit-robocasa-baseline-4step-mujoco"
-# run bash scripts/eval_dit4dit_robocasa.sh --sim instinct --arm baseline --steps 4 --full --output-dir "$R/dit4dit-robocasa-baseline-4step-instinct"
+dit4dit run bash scripts/eval_dit4dit_robocasa.sh --sim mujoco --arm baseline --steps 4 --full --output-dir "$R/dit4dit-robocasa-baseline-4step-mujoco"
+# dit4dit run bash scripts/eval_dit4dit_robocasa.sh --sim instinct --arm baseline --steps 4 --full --output-dir "$R/dit4dit-robocasa-baseline-4step-instinct"

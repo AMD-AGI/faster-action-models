@@ -9,7 +9,8 @@ upstream commit `66a6f3a`.
 [`scripts/train_dit4dit_robocasa_action_vae.sh`](../scripts/train_dit4dit_robocasa_action_vae.sh)
 and
 [`scripts/train_dit4dit_robocasa_latent_policy.sh`](../scripts/train_dit4dit_robocasa_latent_policy.sh),
-then evaluate it with `scripts/eval_dit4dit_robocasa.sh --arm cae` (all below).
+then evaluate it with `scripts/eval_dit4dit_robocasa.sh --arm cae`, run inside the
+evaluation image through `scripts/in_eval_image.sh` (all below).
 
 The policy fine-tunes NVIDIA Cosmos-Predict2.5-2B (gated; NVIDIA Open Model
 License), which you download from NVIDIA. The training dataset, GR00T-X-Embodiment-Sim, is CC BY 4.0. The RoboCasa-GR1
@@ -70,6 +71,16 @@ python -m pip install -e . --no-deps
 python -m pip install -r environments/requirements-train-rocm.txt
 ```
 
+Run every training step below in this environment. The evaluation
+environments `environments/setup_dit4dit_rocm_envs.sh` builds serve the
+launchers and the action-VAE trainer, but not the DeepSpeed-launched policy
+trainers (`MissingCUDAException: CUDA_HOME does not exist`). Start the
+container with the GPUs (`--device=/dev/kfd --device=/dev/dri`, the `video` and
+`render` groups) and with `--ipc=host` (or a `--shm-size` that fits the staged
+dataset plus 64 GiB, see below). `rocm/primus:v26.2` has no `/usr/bin/time`;
+install it (`apt-get install -y time`) if you want the wrappers' resource
+reports.
+
 ### Cosmos-Predict2.5-2B
 
 Every DiT4DiT model in this repository loads the NVIDIA Cosmos-Predict2.5-2B
@@ -109,7 +120,7 @@ reset patch, and download its separately licensed simulator assets:
 ```bash
 bash environments/setup_robocasa_gr1.sh
 python -m pip install -e robocasa-gr1-tabletop-tasks
-python robocasa-gr1-tabletop-tasks/robocasa/scripts/download_kitchen_assets.py
+yes y | python robocasa-gr1-tabletop-tasks/robocasa/scripts/download_kitchen_assets.py   # asks y/n; about 5 GB
 (cd robocasa-gr1-tabletop-tasks/robocasa/scripts && python download_groot_assets.py -y)
 ```
 
@@ -265,7 +276,10 @@ plus 64 GiB free. Other AMD Instinct™ GPUs are accepted with a warning;
 smaller node, lower `NUM_PROCESSES` (listing that many GPUs in
 `HIP_VISIBLE_DEVICES`) and raise `GRADIENT_ACCUMULATION_STEPS` to keep the
 global batch of 128. Its defaults encode the production optimization
-settings and save full models every 50K steps. The top-level wrapper records
+settings and save full models every 50K steps. For a short smoke run, also set
+`SAVE_INTERVAL` and `FULL_MODEL_SAVE_INTERVAL` to at most `MAX_TRAIN_STEPS`: the
+run directory's `config.yaml`, which the CAE-DiT4DiT server needs next to the
+checkpoint, is written only at those saves. The top-level wrapper records
 resource usage as `training_time.txt` in the policy run directory.
 
 ## Reproduce the seed-7 evaluation
@@ -275,11 +289,14 @@ assignments. Result files are resumable per task, but an already completed
 output directory is never overwritten.
 
 From the parent repository, the standalone launcher runs the full protocol and
-validates the result files:
+validates the result files. It runs in the evaluation image with the
+environments `environments/setup_dit4dit_rocm_envs.sh` builds (`EVAL_IMAGE` and
+the variables the script prints;
+[DiT4DiT Python environments on ROCm](side-by-side-source-trees.md#dit4dit-python-environments-on-rocm)):
 
 ```bash
 export DIT4DIT_ROBOCASA_CKPT="${CAE_DIT4DIT_CKPT}"
-(cd .. && bash scripts/eval_dit4dit_robocasa.sh --arm cae)
+(cd .. && bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_robocasa.sh --arm cae)
 ```
 
 This is the repository's one RoboCasa protocol; the same launcher evaluates the
