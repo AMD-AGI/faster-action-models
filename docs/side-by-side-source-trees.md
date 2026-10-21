@@ -224,7 +224,7 @@ skipped, and `.run_identity` refuses a directory holding another run.
 
 As everywhere else in this repository, no results are recorded here. Latency
 figures are not portable across nodes, drivers, or sessions, and success rates
-are given as reference results in the accompanying write-up.
+are given as reference results in the accompanying ROCm blog.
 `scripts/cae_fastwam_latency.py` times CAE-FastWAM at 10 and 4 steps
 (`cae@10,cae@4` by default) in one interleaved session, so the figures can be
 reproduced where they matter.

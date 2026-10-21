@@ -5,7 +5,7 @@ Inference optimization and Compact Action Experts for World Action Models
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-Full write-up and reference results:
+ROCm blog with the reference results:
 [Optimizing World Action Models on AMD GPUs](https://rocm.blogs.amd.com/artificial-intelligence/faster-action-models/README.html).
 Released checkpoint: [`amd/CAE-FastWAM`](https://huggingface.co/amd/CAE-FastWAM), in the [CAE collection](https://huggingface.co/collections/amd/compact-action-expert-cae).
 
@@ -203,7 +203,7 @@ docs/                guides; model_cards/ holds the Hugging Face model card
 
 ## Citation
 
-If you use this repository, please cite the write-up and the upstream models:
+If you use this repository, please cite the ROCm blog and the upstream models:
 
 ```bibtex
 @misc{kandala2026faster,
