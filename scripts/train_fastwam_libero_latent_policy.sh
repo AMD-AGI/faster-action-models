@@ -24,9 +24,13 @@ Optional environment:
   TIME_LOG                 Resource report path (default: run directory)
   FASTWAM_ROOT             Default: <repo>/FastWAM
 
-The LIBERO datasets, per-suite statistics, text cache, and Wan assets must
-match the paths in the task configuration. Additional arguments are forwarded
-as Hydra overrides.
+Additional arguments are forwarded as Hydra overrides. The task configuration
+reads its data from these keys (defaults relative to FastWAM/):
+  libero_data_root=./data/libero_mujoco3.3.2        LIBERO LeRobot 2.1 suites
+  per_suite_stats_dir=../checkpoints/CAE-FastWAM/stats   libero_{suite}.json
+  text_embeds_cache_dir=./data/text_embeds_cache/libero  precompute_text_embeds.py
+The Wan assets come from DIFFSYNTH_MODEL_BASE_PATH. Data preparation:
+docs/cae-fastwam-libero.md#training-data.
 EOF
 }
 

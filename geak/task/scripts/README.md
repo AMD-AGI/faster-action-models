@@ -6,7 +6,7 @@
 > `docs/fastwam-geak-inference-optimization.md`; adapt the model-specific API and
 > shapes before using the harness with another model.
 
-`task_runner.py` implements the four commands GEAK calls. It is intentionally
+`task_runner.py` implements the commands GEAK calls (and `rollout`, for manual probing). It is intentionally
 thin: it overlays the edited files onto a pristine tree, then shells out to the
 measurement and gate scripts.
 
@@ -16,7 +16,8 @@ measurement and gate scripts.
 | `performance` | the scored metric (`episode_perf.py`) |
 | `oracle` | cheap numerics pre-filter (`episode_oracle.py`) — NOT the authority |
 | `oracle-refresh` | re-record the oracle golden, calibrated cross-process |
-| `correctness` | oracle, then the closed-loop rollout — the rollout decides. The rollout also fails if any activation marker the candidate's source emits (`ACTIVATION_MARKERS` in `task_runner.py`) is missing from the server log, or a graph capture fell back, so a candidate cannot pass on the unoptimized fallback path. |
+| `rollout` | the closed-loop rollout alone (no oracle), for manual probing |
+| `correctness` | oracle, then the closed-loop rollout — the rollout decides. The rollout also fails if any activation marker the candidate's source emits (`ACTIVATION_MARKERS` in `task_runner.py`) is missing from the evaluator worker's log, or a graph capture fell back, so a candidate cannot pass on the unoptimized fallback path. |
 
 ## Two things that are easy to get wrong
 

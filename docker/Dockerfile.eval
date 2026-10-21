@@ -1,0 +1,57 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# FastWAM LIBERO evaluation image (EVAL_IMAGE) for eval/native/run_fastwam_libero.sh (and
+# scripts/eval_fastwam_libero.sh, a wrapper over it): ROCm 7.14 PyTorch 2.11 (Python 3.12), the pinned evaluator
+# stack from eval/native/requirements-fastwam-libero.txt, and LIBERO.
+#
+# Build from the repository root (the build context only needs eval/native/requirements-fastwam-libero.txt):
+#   docker build -f docker/Dockerfile.eval -t fam-eval:rocm7.14 .
+#   export EVAL_IMAGE=fam-eval:rocm7.14
+#
+# The launcher still takes a host checkout of LIBERO at the same commit (LIBERO_ROOT) and mounts it; the copy
+# installed here provides the Python dependencies and the default LIBERO config. See eval/native/README.md.
+ARG BASE=rocm/pytorch:rocm7.14_ubuntu24.04_py3.12_pytorch_release_2.11.0
+FROM ${BASE}
+
+ARG LIBERO_COMMIT=8f1084e3132a39270c3a13ebe37270a43ece2a01
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    TOKENIZERS_PARALLELISM=false
+
+# OpenGL for MuJoCo camera rendering: libGL.so.1 (PyOpenGL loads it even on EGL, so LIBERO does not import
+# without it), EGL for GPU rendering with --sim mujoco, and OSMesa, the fallback and the --sim instinct helper contexts.
+# GNU time: the training wrappers (scripts/train_*.sh) write /usr/bin/time -v resource reports when it is present.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libgl1 libegl1 libegl-mesa0 libosmesa6 libglu1-mesa git ca-certificates time \
+ && rm -rf /var/lib/apt/lists/*
+
+# The pinned evaluator stack. Its fsspec pin is newer than the one datasets declares, so pip's resolver
+# rejects the file as a whole: install everything else, then fsspec without dependency resolution, which
+# reproduces the environment the evaluations ran in.
+COPY eval/native/requirements-fastwam-libero.txt /tmp/requirements-fastwam-libero.txt
+RUN python3 -c "import torch; print('base torch', torch.__version__)" \
+ && grep -v '^fsspec==' /tmp/requirements-fastwam-libero.txt > /tmp/requirements-no-fsspec.txt \
+ && pip install -r /tmp/requirements-no-fsspec.txt \
+ && pip install --no-deps "$(grep '^fsspec==' /tmp/requirements-fastwam-libero.txt)"
+
+# LIBERO (its dependencies are pinned above) at the commit the evaluations used.
+RUN git clone https://github.com/Lifelong-Robot-Learning/LIBERO /opt/LIBERO \
+ && git -C /opt/LIBERO checkout -q "${LIBERO_COMMIT}" \
+ && pip install --no-deps -e /opt/LIBERO
+
+# `pip install -e` does not make LIBERO importable (its top-level package is not found by the editable finder);
+# put the checkout on sys.path with a .pth file. The launchers still put LIBERO_ROOT first on PYTHONPATH.
+RUN echo /opt/LIBERO > "$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')/libero_checkout.pth"
+
+# LIBERO asks interactive questions on its first import unless $LIBERO_CONFIG_PATH/config.yaml exists (EOFError in a
+# container). Write the default config for /opt/LIBERO; a LIBERO_CONFIG_PATH passed to the launchers overrides it.
+ENV LIBERO_CONFIG_PATH=/opt/libero_config
+RUN mkdir -p /opt/libero_config /opt/LIBERO/libero/datasets && L=/opt/LIBERO/libero/libero && printf '%s\n' \
+      "benchmark_root: $L" "bddl_files: $L/bddl_files" "init_states: $L/init_files" \
+      "datasets: /opt/LIBERO/libero/datasets" "assets: $L/assets" > /opt/libero_config/config.yaml \
+ && chmod -R a+rX /opt/libero_config \
+ && cd / && python3 -c "from libero.libero import benchmark, get_libero_path; print('libero', get_libero_path('bddl_files'))" < /dev/null
+
+# Fail the build if anything above replaced the image's ROCm PyTorch.
+RUN python3 -c "import torch, torchvision; v = torch.__version__; print('torch', v, 'torchvision', torchvision.__version__); assert v.startswith('2.11.0+rocm7.14'), v"

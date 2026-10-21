@@ -42,9 +42,11 @@ git clone https://github.com/AMD-AGI/GEAK.git
 cd GEAK && git checkout fa86fd1     # validated for this workflow on gfx950
 ```
 
-The harness expects a container with **torch 2.11 + ROCm 7.14** (HIP 7.14,
+The task commands expect a container with **torch 2.11 + ROCm 7.14** (HIP 7.14,
 triton 3.7.1) plus LIBERO/MuJoCo, and the FastWAM sources importable. Any image
 satisfying that works; `EVAL_IMAGE` selects it.
+[`docker/Dockerfile.eval`](../docker/Dockerfile.eval) builds one
+(`docker build -f docker/Dockerfile.eval -t fam-eval:rocm7.14 .`).
 
 ### Prerequisites
 
@@ -52,17 +54,19 @@ satisfying that works; `EVAL_IMAGE` selects it.
 export MODEL_SRC_ROOT="<FastWAM checkout>"          # holds src/ and configs/
 export MODEL_CKPT="<...>/libero_uncond_2cam224.pt"
 export DATASET_STATS="<...>/libero_uncond_2cam224_dataset_stats.json"
-export EVAL_HARNESS="<vla-evaluation-harness checkout>"
-export LIBERO_ROOT="<LIBERO checkout>"
-export LIBERO_CONFIG_PATH="$HOME/.libero"
+export LIBERO_ROOT="<LIBERO checkout>"               # correctness only
+export LIBERO_CONFIG_PATH="$HOME/.libero"            # correctness only
 export HF_CACHE_DIR="<hf cache>"
 export MODEL_PYTHON="/opt/venv/bin/python3"
-export EVAL_IMAGE="<docker image>"
+export EVAL_IMAGE="fam-eval:rocm7.14"                 # docker/Dockerfile.eval
 export GEAK_ROOT="<GEAK checkout, pinned above>"
 ```
 
 `run_local.sh` bind-mounts these host paths at their absolute locations. They do
-not need to live under `/mnt` or `/tmp`. Comparison runs may additionally set
+not need to live under `/mnt` or `/tmp`. `correctness` runs its LIBERO episodes
+with FastWAM's own evaluator (`MODEL_SRC_ROOT/experiments/libero/eval_libero_single.py`,
+one persistent worker); `EVAL_DOCKER_ARGS` adds `docker run` flags (a container
+name, `--cpuset-cpus`) to every task container. Comparison runs may additionally set
 `FWE_SRC` to a complete import root containing `fastwam/`, and with it
 `FWE_CONFIG_DIR` to the config tree that source takes (default
 `MODEL_SRC_ROOT/configs`; `scripts/compare_artifacts.py` sets

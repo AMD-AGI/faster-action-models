@@ -1,0 +1,21 @@
+# Copyright (c) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# FastWAM / CAE-FastWAM training on ROCm: what training needs on top of the evaluation image
+# (docker/Dockerfile.eval: ROCm 7.14, PyTorch 2.11.0, eval/native/requirements-fastwam-libero.txt).
+# Do not install pyproject.toml's dependencies on ROCm: they pin CUDA builds of torch and torchvision.
+#
+#   apt-get install -y --no-install-recommends ffmpeg      # FFmpeg shared libraries for torchcodec
+#   pip install -r docker/requirements-fastwam-train.txt
+#
+# Nothing here replaces the image's PyTorch.
+
+# accelerate's DeepSpeed ZeRO launch (scripts/train_zero1.sh, scripts/train_zero2.sh)
+deepspeed==0.18.7
+hjson==3.1.0
+ninja==1.13.0
+py-cpuinfo==9.0.0
+
+# LeRobot video decoding: torchvision 0.26 no longer has io.VideoReader, so the vendored LeRobot needs
+# torchcodec (the release that matches PyTorch 2.11) and the FFmpeg libraries above.
+torchcodec==0.11.1

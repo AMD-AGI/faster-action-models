@@ -4,16 +4,14 @@
 
 * A rerun into an existing output directory resumes only the same run; a
   directory holding results of another arm, tree, checkpoint, step or trial
-  count is refused (RoboCasa protocol.json, the FastWAM engines' and the native
-  launcher's .run_identity, the CAE-FastWAM engine's .done_<suite> markers).
-* The FastWAM launcher takes the protocol and its flags, never the engines'
-  standalone env knobs, and warns when a tree or config override differs from
-  what --arm selects.
+  count is refused (RoboCasa protocol.json, the FastWAM launcher's .run_identity).
+* scripts/eval_fastwam_libero.sh, a wrapper over the native FastWAM launcher,
+  ignores the former policy-server engine's env knobs with a warning.
 * DiT4DiT LIBERO counts a failed client the same way with one client or K.
 * The latency tools take --gpus and time the FastWAM GEAK arm as it is evaluated.
 
-The engines run against a stand-in `docker` that fails at once, so they stop
-at the first server start; everything checked here happens before that.
+The launchers run against a stand-in `docker` that fails at once, so they stop
+at the first container start; everything checked here happens before that.
 """
 from __future__ import annotations
 
@@ -51,7 +49,7 @@ class Sandbox:
         docker = bin_dir / "docker"
         docker.write_text("#!/usr/bin/env bash\nexit 1\n")
         docker.chmod(0o755)
-        for name in ("harness", "libero", "home", "inductor", "triton", "configs/task"):
+        for name in ("libero", "home", "inductor", "triton", "configs/task"):
             (root / name).mkdir(parents=True)
         for name in ("model.pt", "vae.pt", "stats.json"):
             (root / name).write_text("x\n")
@@ -63,7 +61,6 @@ class Sandbox:
             "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
             "HOME": str(root / "home"),
             "EVAL_IMAGE": "test-image",
-            "EVAL_HARNESS": str(root / "harness"),
             "LIBERO_ROOT": str(root / "libero"),
             "MODEL_CKPT": str(root / "model.pt"),
             "DATASET_STATS": str(root / "stats.json"),
@@ -119,122 +116,75 @@ class ClaimRunDirTests(unittest.TestCase):
             self.assertEqual(marker.read_text(), "arm=a\n")
 
 
-class FastwamBaselineGeakResumeTests(unittest.TestCase):
-    LAUNCHER = ROOT / "scripts" / "eval_fastwam_libero.sh"
+class FastwamWrapperTests(unittest.TestCase):
+    """scripts/eval_fastwam_libero.sh: the native launcher, one GPU by default, former engine knobs ignored."""
 
-    def test_launcher_ignores_engine_knobs_and_resumes_only_the_same_cell(self):
+    LAUNCHER = ROOT / "scripts" / "eval_fastwam_libero.sh"
+    RESULT = Path("libero_spatial") / "gpu0_task0_results.json"
+
+    def test_wrapper_ignores_engine_knobs_and_resumes_only_the_same_run(self):
         with tempfile.TemporaryDirectory() as td:
             box = Sandbox(Path(td))
-            env = {**box.env, "SEED": "7", "WAIT": "5", "SHARDS": "3",
-                   "SUITES_CSV": "libero_goal", "TASK_CONFIG": "cae"}
+            env = {**box.env, "SEED": "7", "WAIT": "5", "SHARDS": "3", "SUITES_CSV": "libero_goal",
+                   "PORT": "9000", "EVAL_PORT": "9001", "EVAL_ARM_LABEL": "x"}
+            env.pop("EVAL_GPUS", None)
             first = box.run(self.LAUNCHER, "--smoke", "--output-dir", str(box.out), env=env)
             self.assertEqual(first.returncode, 1, first.stderr)  # the stand-in docker fails
-            for name in ("SEED", "WAIT", "SHARDS", "SUITES_CSV", "TASK_CONFIG"):
+            for name in ("SEED", "WAIT", "SHARDS", "SUITES_CSV", "PORT", "EVAL_PORT", "EVAL_ARM_LABEL"):
                 self.assertIn(f"warning: ignoring {name}=", first.stderr)
-            identity = (box.out / "baseline_10step" / ".run_identity").read_text().splitlines()
-            for line in ("seed=42", "num_steps_wait=30", "shards=10", "trials=1", "task_config=",
+            identity = (box.out / ".run_identity").read_text().splitlines()
+            for line in ("arm=baseline", "trials=1", "steps=10", "mode=serial", "sim=mujoco",
                          f"tree={ROOT / 'src' / 'fastwam-baseline'}",
                          f"configs={ROOT / 'FastWAM' / 'configs_baseline'}"):
                 self.assertIn(line, identity)
+            self.assertIn("gpus=0 ", first.stdout)  # one worker on GPU 0, the wrapper's default
 
-            (box.out / "baseline_10step" / "LIBEROBenchmark_libero_spatial_shard0.json").write_text("{}")
+            (box.out / self.RESULT).parent.mkdir(parents=True)
+            (box.out / self.RESULT).write_text("{}")
             refused = box.run(self.LAUNCHER, "--full", "--output-dir", str(box.out), env=box.env)
             self.assertEqual(refused.returncode, 2, refused.stderr)
-            self.assertIn("refusing to resume", refused.stderr)
             self.assertIn("recorded: trials=1", refused.stderr)
 
             same = box.run(self.LAUNCHER, "--smoke", "--output-dir", str(box.out), env=box.env)
-            self.assertNotIn("refusing to resume", same.stderr)
+            self.assertNotIn("recorded:", same.stderr)
 
     def test_unrecorded_results_are_refused(self):
         with tempfile.TemporaryDirectory() as td:
             box = Sandbox(Path(td))
-            cell = box.out / "baseline_10step"
-            cell.mkdir(parents=True)
-            (cell / "LIBEROBenchmark_libero_spatial_shard0.json").write_text("{}")
+            (box.out / self.RESULT).parent.mkdir(parents=True)
+            (box.out / self.RESULT).write_text("{}")
             result = box.run(self.LAUNCHER, "--output-dir", str(box.out), env=box.env)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("no record of the run", result.stderr)
 
-    def test_tree_and_config_overrides_warn(self):
+    def test_tree_and_config_overrides_are_ignored(self):
         with tempfile.TemporaryDirectory() as td:
             box = Sandbox(Path(td))
-            other = str(ROOT / "src" / "cae-fastwam")
-            env = {**box.env, "BASELINE_SRC": other, "MODEL_CONFIGS": str(ROOT / "FastWAM" / "configs")}
-            result = box.run(self.LAUNCHER, "--smoke", "--output-dir", str(box.out), env=env)
-            self.assertIn(f"warning: BASELINE_SRC={other} overrides", result.stderr)
-            self.assertIn("warning: MODEL_CONFIGS=", result.stderr)
-            self.assertIn("which --arm baseline selects", result.stderr)
-            # The resolved values themselves are not overrides.
-            env = {**box.env, "BASELINE_SRC": str(ROOT / "src" / "fastwam-baseline"),
-                   "OPTIMIZED_SRC": str(ROOT / "src" / "fastwam-geak")}
-            result = box.run(self.LAUNCHER, "--smoke", "--output-dir", str(box.out), env=env)
-            self.assertNotIn("overrides", result.stderr)
-            # --arm cae has its own override; the other arms' are ignored, with a warning.
-            env = {**box.cae_env(), "BASELINE_SRC": str(ROOT / "src" / "fastwam-baseline"),
-                   "OPTIMIZED_SRC": str(ROOT / "src" / "fastwam-geak")}
-            result = box.run(self.LAUNCHER, "--arm", "cae", "--smoke", "--output-dir", str(box.out / "cae"),
-                             env=env)
-            self.assertNotRegex(result.stderr, r"_SRC=\S+ overrides")
-            self.assertIn("warning: ignoring OPTIMIZED_SRC=", result.stderr)
-            self.assertIn("warning: ignoring BASELINE_SRC=", result.stderr)
-            env = {**box.cae_env(), "CAE_SRC": str(ROOT / "src" / "fastwam-geak")}
-            result = box.run(self.LAUNCHER, "--arm", "cae", "--smoke", "--output-dir", str(box.out / "cae2"),
-                             env=env)
-            self.assertIn(f"warning: CAE_SRC={ROOT / 'src' / 'fastwam-geak'} overrides", result.stderr)
+            env = {**box.cae_env(), "BASELINE_SRC": str(ROOT / "src" / "fastwam-geak"),
+                   "OPTIMIZED_SRC": str(ROOT / "src" / "fastwam-baseline")}
+            result = box.run(self.LAUNCHER, "--arm", "cae", "--smoke", "--suites", "libero_spatial",
+                             "--output-dir", str(box.out), env=env)
+            for name in ("MODEL_CONFIGS", "BASELINE_SRC", "OPTIMIZED_SRC", "CAE_SRC"):
+                self.assertIn(f"warning: ignoring {name}=", result.stderr)
+            self.assertIn(f"tree={ROOT / 'src' / 'cae-fastwam'}", (box.out / ".run_identity").read_text())
 
-
-class CaeFastwamResumeTests(unittest.TestCase):
-    ENGINE = ROOT / "eval" / "run_eval_cae_fastwam.sh"
-    ARGS = ("--suites", "libero_spatial", "--gpus", "0")
-
-    def test_done_markers_record_the_run_and_refuse_another(self):
+    def test_policy_server_flags_are_refused(self):
         with tempfile.TemporaryDirectory() as td:
             box = Sandbox(Path(td))
-            env = box.cae_env()
-            first = box.run(self.ENGINE, *self.ARGS, "--trials", "50", env=env)
-            self.assertEqual(first.returncode, 1, first.stderr)
-            out = box.out / "cae_10step"
-            identity = (out / ".run_identity").read_text()
-            self.assertIn("trials=50\n", identity)
-            self.assertIn("steps=10\n", identity)
-            self.assertIn(f"tree={ROOT / 'src' / 'cae-fastwam'}\n", identity)
+            for flag in ("--port", "--clients-per-gpu", "--shards"):
+                with self.subTest(flag=flag):
+                    result = box.run(self.LAUNCHER, flag, "1", "--dry-run", env=box.env)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("runs no policy server", result.stderr)
 
-            # A finished suite of this run is skipped ...
-            (out / ".done_libero_spatial").write_text(identity)
-            same = box.run(self.ENGINE, *self.ARGS, "--trials", "50", env=env)
-            self.assertEqual(same.returncode, 0, same.stderr)
-            self.assertIn("skip libero_spatial (already done)", same.stdout)
-
-            # ... but never under a run with another trial count.
-            other = box.run(self.ENGINE, *self.ARGS, "--trials", "1", env=env)
-            self.assertEqual(other.returncode, 2, other.stderr)
-            self.assertIn("recorded: trials=50", other.stderr)
-            self.assertNotIn("skip libero_spatial", other.stdout)
-
-    def test_bare_done_marker_is_not_trusted(self):
-        with tempfile.TemporaryDirectory() as td:
-            box = Sandbox(Path(td))
-            out = box.out / "cae_10step"
-            out.mkdir(parents=True)
-            (out / ".done_libero_spatial").touch()
-            result = box.run(self.ENGINE, *self.ARGS, env=box.cae_env())
-            self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn("no record of the run", result.stderr)
-
-    def test_launcher_passes_shards_and_drops_suites_csv(self):
-        with tempfile.TemporaryDirectory() as td:
-            box = Sandbox(Path(td))
-            env = {**box.cae_env(), "SHARDS": "3", "SUITES_CSV": "libero_goal", "SEED": "1"}
-            env.pop("CAE_SRC")
-            env.pop("MODEL_CONFIGS")
-            result = box.run(ROOT / "scripts" / "eval_fastwam_libero.sh", "--arm", "cae",
-                             "--smoke", "--output-dir", str(box.out), env=env)
-            # FastWAM/configs carries no task "cae"; the engine stops at that check, after
-            # the launcher has dropped the knobs.
-            self.assertIn("warning: ignoring SHARDS=3", result.stderr)
-            self.assertIn("warning: ignoring SUITES_CSV=libero_goal", result.stderr)
-            self.assertIn("per-suite task config missing for libero_spatial", result.stderr)
+    def test_dry_run_matches_the_native_launcher(self):
+        env = {k: v for k, v in os.environ.items() if k not in ("EVAL_GPUS", "EVAL_OUTPUT_ROOT")}
+        args = ("--arm", "geak", "--steps", "2", "--smoke", "--output-dir", "/tmp/x", "--dry-run")
+        wrapper = subprocess.run(["bash", str(self.LAUNCHER), *args], env=env, capture_output=True, text=True)
+        native = subprocess.run(["bash", str(ROOT / "eval" / "native" / "run_fastwam_libero.sh"), *args,
+                                 "--gpus", "0"], env=env, capture_output=True, text=True)
+        self.assertEqual(wrapper.returncode, 0, wrapper.stderr)
+        self.assertEqual(wrapper.stdout, native.stdout)
 
 
 class NativeResumeTests(unittest.TestCase):
@@ -255,6 +205,59 @@ class NativeResumeTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("recorded: arm=geak", result.stderr)
             self.assertIn("this run: arm=baseline", result.stderr)
+
+
+class NativeWanPreflightTests(unittest.TestCase):
+    LAUNCHER = ROOT / "eval" / "native" / "run_fastwam_libero.sh"
+
+    def test_missing_wan_assets_are_named_before_any_worker(self):
+        with tempfile.TemporaryDirectory() as td:
+            box = Sandbox(Path(td))
+            (box.root / "wan").mkdir()
+            env = {**box.env, "DIFFSYNTH_MODEL_BASE_PATH": str(box.root / "wan"), "DIFFSYNTH_SKIP_DOWNLOAD": "true"}
+            result = box.run(self.LAUNCHER, "--output-dir", str(box.out), "--gpus", "0", env=env)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("missing Wan asset", result.stderr)
+            self.assertIn("Wan2.2_VAE.pth", result.stderr)
+            self.assertFalse((box.out / ".run_identity").exists())
+
+
+class NativeMountTests(unittest.TestCase):
+    """eval/native/run_fastwam_libero.sh mounts every path variable, not only the repository, /mnt and /tmp."""
+
+    LAUNCHER = ROOT / "eval" / "native" / "run_fastwam_libero.sh"
+
+    @unittest.skipUnless(os.access("/var/tmp", os.W_OK), "needs a writable /var/tmp (outside the /tmp mount)")
+    def test_path_variables_outside_the_default_mounts_are_mounted(self):
+        with tempfile.TemporaryDirectory(dir="/var/tmp") as td:
+            box = Sandbox(Path(td))
+            log = box.root / "docker_args.txt"
+            (box.root / "bin" / "docker").write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$@" >> {log}\nexit 1\n')
+            for name in ("ckpts/stats", "ckpts/model", "wan", "hfhome", "libero_config", "overlay"):
+                (box.root / name).mkdir(parents=True)
+            for wan in ("Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth", "Wan-AI/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth",
+                        "Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl/tokenizer.json"):
+                (box.root / "wan" / wan).parent.mkdir(parents=True, exist_ok=True)
+                (box.root / "wan" / wan).write_text("x\n")
+            (box.root / "ckpts" / "model" / "model.pt").write_text("x\n")
+            env = {**box.env, "MUJOCO_GL": "osmesa", "DIFFSYNTH_MODEL_BASE_PATH": str(box.root / "wan"),
+                   "HF_HOME": str(box.root / "hfhome"), "LIBERO_CONFIG_PATH": str(box.root / "libero_config"),
+                   "EVAL_PYOVERLAY": str(box.root / "overlay"), "MODEL_CKPT": str(box.root / "ckpts/model/model.pt"),
+                   "DATASET_STATS": str(box.root / "ckpts" / "stats" / "s.json"),
+                   "DIFFSYNTH_SKIP_DOWNLOAD": "true", "TOKENIZERS_PARALLELISM": "false"}
+            box.run(self.LAUNCHER, "--output-dir", str(box.out), "--gpus", "0", "--suites", "libero_spatial",
+                    "--trials", "1", env=env, timeout=120)
+            args = log.read_text().splitlines()
+            r = box.root.resolve()
+            for path, mode in ((box.out, "rw"), (r / "wan", "rw"), (r / "hfhome", "rw"), (r / "libero", "ro"),
+                               (r / "libero_config", "ro"), (r / "ckpts" / "model", "ro"),
+                               (r / "ckpts" / "stats", "ro"), (r / "overlay", "ro")):
+                with self.subTest(path=str(path)):
+                    self.assertIn(f"{Path(path).resolve()}:{Path(path).resolve()}:{mode}", args)
+            self.assertNotIn(f"{r}:{r}:ro", args)   # only the paths themselves, not their parent
+            self.assertNotIn(f"{r / 'out'}:{r / 'out'}:ro", args)
+            for v in ("DIFFSYNTH_SKIP_DOWNLOAD", "TOKENIZERS_PARALLELISM"):
+                self.assertIn(v, args)
 
 
 class RobocasaResumeTests(unittest.TestCase):

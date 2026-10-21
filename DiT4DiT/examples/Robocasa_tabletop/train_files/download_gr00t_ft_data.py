@@ -66,6 +66,12 @@ def parse_args() -> argparse.Namespace:
         help="Download all 24 folders, six standard PnP folders, or the selected three-task subset.",
     )
     parser.add_argument(
+        "--folders",
+        default=None,
+        help="Comma-separated task folder names to download instead of --folder-group, "
+        "e.g. one folder for a smoke test.",
+    )
+    parser.add_argument(
         "--max-workers",
         type=int,
         default=2,
@@ -167,6 +173,11 @@ def main() -> None:
         "pnp3": PNP_3_FOLDERS,
     }
     folders = folder_groups[args.folder_group]
+    if args.folders:
+        folders = [f for f in args.folders.split(",") if f]
+        unknown = [f for f in folders if f not in FOLDERS]
+        if unknown:
+            raise SystemExit(f"unknown folder(s) {unknown}; choose from:\n  " + "\n  ".join(FOLDERS))
 
     print(f"Listing files for {len(folders)} selected folders...", flush=True)
     api = HfApi()
@@ -178,7 +189,7 @@ def main() -> None:
 
     print(
         f"Found {len(target_files)} matching files across "
-        f"{len(folders)} '{args.folder_group}' folders.\n",
+        f"{len(folders)} '{'selected' if args.folders else args.folder_group}' folders.\n",
         flush=True,
     )
 

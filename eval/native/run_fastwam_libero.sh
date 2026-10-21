@@ -9,7 +9,7 @@ source "$ROOT/scripts/eval_flags.sh"
 
 usage() {
   cat <<'EOF'
-FastWAM LIBERO evaluation with FastWAM's own evaluator, no harness; LIBERO on CPU MuJoCo or GPU-native (--sim instinct).
+FastWAM LIBERO evaluation with FastWAM's own evaluator (no policy server); LIBERO on CPU MuJoCo or GPU-native (--sim instinct).
 
 Usage:
   bash eval/native/run_fastwam_libero.sh [options]
@@ -27,7 +27,7 @@ Options:
   --arm NAME      baseline (default), geak or cae (CAE-FastWAM: Compact Action Expert, the 32-hidden-dimension
                     Action DiT with the K8 x d16 action VAE, GEAK-optimized; one suite at a time).
   --steps N       Denoise steps (default 10). Advertised: baseline 10, geak 10 and 2, cae 10 and 4. Baseline at
-                    other than 10 needs --allow-baseline-steps, as in scripts/eval_fastwam_libero.sh.
+                    other than 10 needs --allow-baseline-steps.
   --smoke         1 trial per task.   --full  50 trials per task (default).   --trials N  trials per task.
   --suites CSV    Default: libero_spatial,libero_object,libero_goal,libero_10.
   --gpus CSV      GPUs (default 0,1,2,3): one worker per GPU pulling (suite, task) items. There is no protocol behind
@@ -55,7 +55,12 @@ Required environment:
   baseline, geak: DATASET_STATS     cae: TASK_CONFIG (base name), DATASET_STATS_TEMPLATE ({suite}), ACTION_VAE_CKPT
 Optional: STEPS, TRIALS (defaults for --steps, --trials), EVAL_GPUS (default for --gpus), EVAL_OUTPUT_ROOT (default
   for --output-dir), EVAL_PYOVERLAY (extra PYTHONPATH entries, e.g. FastWAM eval deps the image lacks),
-  LIBERO_CONFIG_PATH, HF_HOME, DIFFSYNTH_MODEL_BASE_PATH, DIFFSYNTH_DOWNLOAD_SOURCE (forwarded when set).
+  LIBERO_CONFIG_PATH, HF_HOME, DIFFSYNTH_MODEL_BASE_PATH, DIFFSYNTH_DOWNLOAD_SOURCE, DIFFSYNTH_SKIP_DOWNLOAD,
+  TOKENIZERS_PARALLELISM (forwarded when set), EVAL_DOCKER_ARGS (extra `docker run` flags for every worker, e.g.
+  "--cpuset-cpus 0-31"; not --name). The container sees the repository, /mnt and /tmp, plus every path
+  above (LIBERO_ROOT, LIBERO_CONFIG_PATH, INSTINCT_SIM_BUILD, the checkpoint and statistics directories,
+  DIFFSYNTH_MODEL_BASE_PATH, HF_HOME, EVAL_PYOVERLAY entries, the output directory), each mounted at its own path.
+  Symlinks inside them must resolve to a mounted path.
 EOF
 }
 
@@ -136,6 +141,23 @@ else
   eval_require DATASET_STATS_TEMPLATE "the per-suite statistics path, with the token {suite} (--arm cae)"
   eval_require ACTION_VAE_CKPT "the action-VAE checkpoint (--arm cae)"
 fi
+# The Wan assets (MODEL_ZOO.md, "Shared runtime assets"). Without them the model loader fails deep inside the first
+# worker with "Cannot detect model type ... File: []", so name the missing files up front. The evaluator runs in
+# FastWAM/, whose ./checkpoints/ is DiffSynth's default when DIFFSYNTH_MODEL_BASE_PATH is unset.
+WAN_BASE="${DIFFSYNTH_MODEL_BASE_PATH:-$ROOT/FastWAM/checkpoints}"
+missing_wan=()
+for f in Wan-AI/Wan2.2-TI2V-5B/Wan2.2_VAE.pth Wan-AI/Wan2.2-TI2V-5B/models_t5_umt5-xxl-enc-bf16.pth \
+         Wan-AI/Wan2.1-T2V-1.3B/google/umt5-xxl; do
+  [[ -e "$WAN_BASE/$f" ]] || missing_wan+=("$WAN_BASE/$f")
+done
+if (( ${#missing_wan[@]} )); then
+  if [[ "${DIFFSYNTH_SKIP_DOWNLOAD:-}" == true ]]; then
+    printf 'missing Wan asset (MODEL_ZOO.md, "Shared runtime assets"; DIFFSYNTH_MODEL_BASE_PATH=%s):\n' "$WAN_BASE" >&2
+    printf '  %s\n' "${missing_wan[@]}" >&2
+    exit 2
+  fi
+  echo "warning: Wan assets not found under $WAN_BASE (${missing_wan[*]}); the model loader will try to download them" >&2
+fi
 if [[ "$SIM" == instinct ]]; then
   [[ -n "${INSTINCT_SIM_BUILD:-}" ]] || { echo "--sim instinct needs INSTINCT_SIM_BUILD (run simulate/build.sh libero)" >&2; exit 2; }
   ls "$INSTINCT_SIM_BUILD"/python/instinct_sim*.so >/dev/null 2>&1 || {
@@ -173,6 +195,28 @@ DOCKER=(docker run --rm --device=/dev/kfd --device=/dev/dri --security-opt secco
   -e "LD_LIBRARY_PATH=${INSTINCT_SIM_BUILD:+$INSTINCT_SIM_BUILD:}/opt/venv/lib/python3.12/site-packages/_rocm_sdk_core/lib"
   # several engine/model processes share a GPU
   -e HSA_ENABLE_SDMA=0 -e GPU_MAX_HW_QUEUES=2)
+# Mount every path the run reads or writes at its own path: writable locations first, then the inputs read-only. A path under one already mounted is skipped.
+MOUNTED=(/mnt /tmp "$ROOT")
+mount_path() {  # $1=path $2=ro|rw
+  [[ -n "$1" ]] || return 0
+  local p m; p="$(realpath -ms "$1")"
+  for m in "${MOUNTED[@]}"; do [[ "$p" == "$m" || "$p" == "$m"/* ]] && return 0; done
+  [[ "$2" == rw ]] && mkdir -p "$p"
+  [[ -e "$p" ]] || { echo "not found, so it cannot be mounted into the container: $1" >&2; exit 2; }
+  DOCKER+=(-v "$p:$p:$2"); MOUNTED+=("$p")
+}
+mount_path "$OUT" rw
+for v in HF_HOME DIFFSYNTH_MODEL_BASE_PATH; do mount_path "${!v:-}" rw; done
+for v in LIBERO_ROOT LIBERO_CONFIG_PATH INSTINCT_SIM_BUILD; do mount_path "${!v:-}" ro; done
+# checkpoint and statistics files: their directories
+mount_path "$(dirname "$MODEL_CKPT")" ro
+[[ -n "${DATASET_STATS:-}" ]] && mount_path "$(dirname "$DATASET_STATS")" ro
+for S in "${SUITES[@]}"; do
+  [[ -n "${DATASET_STATS_TEMPLATE:-}" ]] && mount_path "$(dirname "${DATASET_STATS_TEMPLATE//\{suite\}/$S}")" ro
+done
+[[ -n "${ACTION_VAE_CKPT:-}" ]] && mount_path "$(dirname "$ACTION_VAE_CKPT")" ro
+IFS=: read -r -a overlay <<< "${EVAL_PYOVERLAY:-}"
+for p in "${overlay[@]+"${overlay[@]}"}"; do mount_path "$p" ro; done
 if [[ "$SIM" == instinct ]]; then
   # The GPU simulator renders the cameras itself; its helper MuJoCo contexts
   # (instinct_sim_libero) stay on OSMesa, whatever MUJOCO_GL says.
@@ -183,9 +227,13 @@ else
   eval_mujoco_gl "${DOCKER[@]}" -e "HIP_VISIBLE_DEVICES=${GPUS[0]}" "$EVAL_IMAGE" /opt/venv/bin/python3 || exit 2
 fi
 DOCKER+=(-e MUJOCO_GL -e PYOPENGL_PLATFORM)
-for v in LIBERO_CONFIG_PATH HF_HOME DIFFSYNTH_MODEL_BASE_PATH DIFFSYNTH_DOWNLOAD_SOURCE ACTION_VAE_CKPT; do
+for v in LIBERO_CONFIG_PATH HF_HOME DIFFSYNTH_MODEL_BASE_PATH DIFFSYNTH_DOWNLOAD_SOURCE DIFFSYNTH_SKIP_DOWNLOAD TOKENIZERS_PARALLELISM ACTION_VAE_CKPT; do
   [[ -n "${!v:-}" ]] && DOCKER+=(-e "$v")
 done
+# EVAL_DOCKER_ARGS: extra `docker run` flags for every worker container (e.g. --cpuset-cpus); not --name,
+# which the launcher sets per worker.
+EXTRA_DOCKER=()
+if [[ -n "${EVAL_DOCKER_ARGS:-}" ]]; then read -r -a EXTRA_DOCKER <<< "$EVAL_DOCKER_ARGS"; fi
 ARMENV=()
 case "$ARM" in
   baseline) ARMENV=(-e FASTWAM_MOT_COMPILE_MODE=off -e FASTWAM_VAE_COMPILE=0 -e FASTWAM_COMPILE=0) ;;
@@ -205,7 +253,7 @@ worker() {  # $1=gpu $2=suite-or-"" (cae runs one suite at a time) $3..=items (b
     PP="$HP/instinct_sim_libero/sitecustomize:$ROOT/$SRC:$HP:$INSTINCT_SIM_BUILD/python:$LIBERO_ROOT${EVAL_PYOVERLAY:+:$EVAL_PYOVERLAY}"
     sim_env=(-e HP_LIBERO_BACKEND=hip)
   fi
-  local -a run=("${DOCKER[@]}" "${ARMENV[@]+"${ARMENV[@]}"}" --name "native_${TAG}_g$G${S:+_$S}"
+  local -a run=("${DOCKER[@]}" "${EXTRA_DOCKER[@]+"${EXTRA_DOCKER[@]}"}" "${ARMENV[@]+"${ARMENV[@]}"}" --name "native_${TAG}_g$G${S:+_$S}"
     -e "HIP_VISIBLE_DEVICES=$G" -e "TORCHINDUCTOR_CACHE_DIR=$cache/inductor" -e "TRITON_CACHE_DIR=$cache/triton")
   if [[ "$MODE" == batched ]]; then
     local specs=() it; for it in "$@"; do specs+=("${it/,/:}"); done
