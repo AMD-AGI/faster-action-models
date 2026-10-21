@@ -8,9 +8,11 @@ from __future__ import annotations
 import argparse
 from importlib.metadata import version
 import json
+import os
 import platform
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -111,8 +113,18 @@ def main() -> None:
     gpu_names = [
         torch.cuda.get_device_name(index) for index in range(gpu_count)
     ]
+    # The reference run used eight MI325X GPUs. Other AMD Instinct GPUs work
+    # but are not the recorded configuration; set REQUIRE_GPU_MODEL (for
+    # example REQUIRE_GPU_MODEL=MI325X) to make a mismatch fatal.
+    required_model = os.environ.get("REQUIRE_GPU_MODEL", "")
+    if required_model and not all(required_model in name for name in gpu_names):
+        raise SystemExit(f"Expected {required_model} GPUs, got: {gpu_names}")
     if not all("MI325X" in name for name in gpu_names):
-        raise SystemExit(f"Expected MI325X GPUs, got: {gpu_names}")
+        print(
+            f"warning: the reference run used MI325X GPUs; got {gpu_names}. "
+            "Throughput, memory headroom and results can differ.",
+            file=sys.stderr,
+        )
 
     disk = shutil.disk_usage(args.repo_root)
     free_gib = disk.free / (1024**3)

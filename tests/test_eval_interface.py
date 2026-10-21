@@ -5,7 +5,7 @@
 * --arm on all four launchers (baseline, geak, and cae where it exists), with
   the specific refusals; an unknown flag is refused;
 * --dry-run on all four, after flag validation and before any asset check;
-* --port and the PORT default, the engines' EVAL_PORT and EVAL_ARM_LABEL;
+* --port and the PORT default (DiT4DiT; the FastWAM launchers run no policy server and refuse --port);
 * --suites validated up front, unsupported flags refused with a reason;
 * the deprecated environment spellings;
 * the common summary.json writer (scripts/eval_summary.py).
@@ -69,7 +69,7 @@ class DryRunTests(unittest.TestCase):
 
     def test_default_output_layout(self):
         cases = {
-            "fastwam": (("--arm", "geak", "--steps", "2"), rf"fastwam-libero-geak-2step-mujoco-{STAMP}"),
+            "fastwam": (("--arm", "geak", "--steps", "2"), rf"fastwam-libero-geak-2step-mujoco-serial-{STAMP}"),
             "native": (("--sim", "instinct", "--mode", "batched"),
                        rf"fastwam-libero-baseline-10step-instinct-batched-{STAMP}"),
             "dit4dit-libero": (("--steps", "2"), rf"dit4dit-libero-baseline-2step-mujoco-{STAMP}"),
@@ -99,10 +99,11 @@ class DryRunTests(unittest.TestCase):
         plan = dry("fastwam", "--arm", "cae", "--steps", "4")
         self.assertEqual(plan["tree"], str(ROOT / "src" / "cae-fastwam"))
         self.assertEqual(plan["configs"], str(ROOT / "FastWAM" / "configs"))
-        self.assertEqual(plan["port"], "8400 (8400 + GPU id)")
+        self.assertEqual(plan["port"], "none (no policy server)")
+        self.assertEqual(plan["gpus"], "0")  # the wrapper's one-GPU default
         plan = dry("fastwam", "--gpus", "3")
         self.assertEqual(plan["configs"], str(ROOT / "FastWAM" / "configs_baseline"))
-        self.assertEqual(plan["port"], "8303 (8300 + GPU id)")
+        self.assertEqual(plan["gpus"], "3")
         plan = dry("fastwam", "--arm", "geak")
         self.assertEqual(plan["configs"], str(ROOT / "FastWAM" / "configs_baseline"))
 
@@ -127,7 +128,7 @@ class MujocoGLDryRunTests(unittest.TestCase):
         self.assertEqual(dry("dit4dit-robocasa", "--sim", "instinct")["mujoco_gl"],
                          "osmesa (--sim instinct helper contexts)")
         self.assertEqual(dry("dit4dit-libero", "--sim", "instinct")["mujoco_gl"],
-                         "unset (unchanged under --sim instinct)")
+                         "osmesa (--sim instinct helper contexts)")
 
 
 class ArmTests(unittest.TestCase):
@@ -177,8 +178,7 @@ class ArmTests(unittest.TestCase):
 
 class PortTests(unittest.TestCase):
     def test_port_flag_and_env_default(self):
-        self.assertEqual(dry("fastwam", "--port", "9000")["port"], "9000")
-        self.assertEqual(dry("fastwam", env={"PORT": "9100"})["port"], "9100")
+        self.assertEqual(dry("fastwam", env={"PORT": "9100"})["port"], "none (no policy server)")
         self.assertEqual(dry("dit4dit-libero", env={"PORT": "9200"})["port"], "9200")
         self.assertEqual(dry("dit4dit-robocasa", "--gpus", "0,1", env={"PORT": "9300"})["port"], "9300,9301")
 
@@ -189,14 +189,17 @@ class PortTests(unittest.TestCase):
         self.assertIn("port=9400\n", result.stdout)
 
     def test_bad_port_and_native_refusal(self):
-        for name in ("fastwam", "dit4dit-libero", "dit4dit-robocasa"):
+        for name in ("dit4dit-libero", "dit4dit-robocasa"):
             with self.subTest(launcher=name):
                 result = run(name, "--dry-run", "--port", "70000")
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("--port must be an integer from 1 to 65535, got: 70000", result.stderr)
-        result = run("native", "--port", "9000")
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("--port is not available with this launcher: it runs no policy server", result.stderr)
+        for name in ("native", "fastwam"):
+            with self.subTest(launcher=name):
+                result = run(name, "--port", "9000")
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("--port is not available with this launcher: it runs no policy server",
+                              result.stderr)
 
 
 class SuitesAndUnsupportedTests(unittest.TestCase):
@@ -219,7 +222,7 @@ class SuitesAndUnsupportedTests(unittest.TestCase):
     def test_unsupported_flags_give_a_reason(self):
         cases = (
             ("dit4dit-robocasa", ("--suites", "libero_goal"), "24 task families"),
-            ("fastwam", ("--mode", "batched"), "eval/native/run_fastwam_libero.sh"),
+            ("fastwam", ("--clients-per-gpu", "2"), "no policy server"),
             ("dit4dit-libero", ("--num-envs", "5"), "FastWAM's"),
             ("native", ("--clients-per-gpu", "2"), "no policy server"),
             ("native", ("--sim", "instinct", "--mode", "batched", "--record-video"), "writes no rollout videos"),
@@ -233,7 +236,7 @@ class SuitesAndUnsupportedTests(unittest.TestCase):
                 self.assertNotIn("unknown argument", result.stderr)
 
     def test_record_video_is_accepted_everywhere(self):
-        expected = {"fastwam": "1", "native": "1 (always)", "dit4dit-libero": "1 (always)",
+        expected = {"fastwam": "1 (always)", "native": "1 (always)", "dit4dit-libero": "1 (always)",
                     "dit4dit-robocasa": "1"}
         for name, value in expected.items():
             with self.subTest(launcher=name):
@@ -256,7 +259,7 @@ class EnvDefaultTests(unittest.TestCase):
             for var in ("STEPS", "TRIALS", "EVAL_GPUS", "EVAL_OUTPUT_ROOT"):
                 with self.subTest(launcher=name, var=var):
                     self.assertIn(var, text)
-            if name != "native":
+            if name not in ("native", "fastwam"):  # the FastWAM launchers run no policy server
                 self.assertIn("PORT", text)
             for flag in ("--arm", "--dry-run", "--record-video"):
                 with self.subTest(launcher=name, flag=flag):
@@ -326,69 +329,46 @@ class EnvDefaultTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
 
 
-class EngineLabelAndPortTests(unittest.TestCase):
-    """The engines take EVAL_PORT and EVAL_ARM_LABEL from the launcher."""
+class FastwamRunSummaryTests(unittest.TestCase):
+    """A FastWAM run names its results after the arm and always ends with summary.json."""
 
     def sandbox(self, td: Path) -> dict:
         bin_dir = td / "bin"
         bin_dir.mkdir()
         (bin_dir / "docker").write_text("#!/usr/bin/env bash\nexit 1\n")
         (bin_dir / "docker").chmod(0o755)
-        for name in ("harness", "libero", "home", "configs/task"):
+        for name in ("libero", "home"):
             (td / name).mkdir(parents=True)
-        for name in ("model.pt", "vae.pt", "stats.json", "stats_libero_goal.json"):
+        for name in ("model.pt", "stats.json"):
             (td / name).write_text("x\n")
-        (td / "configs" / "task" / "cae_libero_goal.yaml").write_text("{}\n")
         return {
             "PATH": f"{bin_dir}{os.pathsep}/usr/bin:/bin", "HOME": str(td / "home"),
-            "EVAL_IMAGE": "img", "EVAL_HARNESS": str(td / "harness"), "LIBERO_ROOT": str(td / "libero"),
+            "EVAL_IMAGE": "img", "LIBERO_ROOT": str(td / "libero"),
             "MODEL_CKPT": str(td / "model.pt"), "DATASET_STATS": str(td / "stats.json"),
-            "TORCHINDUCTOR_CACHE_DIR": str(td / "home" / "i"), "TRITON_CACHE_DIR": str(td / "home" / "t"),
         }
 
-    def test_fastwam_geak_results_are_named_after_the_arm_and_summarized(self):
+    def test_fastwam_geak_run_is_recorded_and_summarized(self):
         with tempfile.TemporaryDirectory() as tmp:
             td = Path(tmp)
-            env = self.sandbox(td)
             out = td / "out"
             result = subprocess.run(
-                ["bash", str(LAUNCHERS["fastwam"]), "--arm", "geak", "--smoke", "--output-dir", str(out),
-                 "--port", "9000"], env=env, capture_output=True, text=True, timeout=60)
+                ["bash", str(LAUNCHERS["fastwam"]), "--arm", "geak", "--smoke", "--suites", "libero_goal",
+                 "--output-dir", str(out)], env=self.sandbox(td), capture_output=True, text=True, timeout=120)
             self.assertEqual(result.returncode, 1, result.stderr)  # the stand-in docker fails
-            self.assertTrue((out / "geak_10step" / ".run_identity").is_file())
-            self.assertFalse((out / "optimized_10step").exists())
+            self.assertIn("arm=geak", (out / ".run_identity").read_text())
             summary = json.loads((out / "summary.json").read_text())
-            self.assertEqual((summary["model"], summary["arm"], summary["steps"]),
-                             ("fastwam", "geak", 10))
+            self.assertEqual((summary["model"], summary["arm"], summary["steps"]), ("fastwam", "geak", 10))
             self.assertEqual(summary["status"], "incomplete")
-            self.assertIn(f"eval incomplete: fastwam libero geak 10step mujoco: 0/0 -> {out}",
-                          result.stdout)
-
-    def test_cae_fastwam_engine_takes_the_port(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            td = Path(tmp)
-            env = {**self.sandbox(td), "ACTION_VAE_CKPT": str(td / "vae.pt"),
-                   "MODEL_CONFIGS": str(td / "configs"), "TASK_CONFIG": "cae",
-                   "DATASET_STATS_TEMPLATE": str(td / "stats_{suite}.json"),
-                   "PORT": "9123"}
-            out = td / "out"
-            result = subprocess.run(
-                ["bash", str(LAUNCHERS["fastwam"]), "--arm", "cae", "--smoke",
-                 "--suites", "libero_goal", "--output-dir", str(out)],
-                env=env, capture_output=True, text=True, timeout=60)
-            self.assertIn("[cae_10step] start gpu=0 port=9123", result.stdout)
-            self.assertIn(f"tree={ROOT / 'src' / 'cae-fastwam'}", result.stdout)
-            self.assertTrue((out / "cae_10step").is_dir())
+            self.assertIn("eval incomplete: fastwam libero geak 10step mujoco", result.stdout)
 
     def test_refused_resume_writes_no_summary(self):
         with tempfile.TemporaryDirectory() as tmp:
             td = Path(tmp)
-            env = self.sandbox(td)
-            cell = td / "out" / "baseline_10step"
-            cell.mkdir(parents=True)
-            (cell / "LIBEROBenchmark_libero_goal_shard0.json").write_text("{}")
+            suite = td / "out" / "libero_goal"
+            suite.mkdir(parents=True)
+            (suite / "gpu0_task0_results.json").write_text("{}")
             result = subprocess.run(["bash", str(LAUNCHERS["fastwam"]), "--output-dir", str(td / "out")],
-                                    env=env, capture_output=True, text=True, timeout=60)
+                                    env=self.sandbox(td), capture_output=True, text=True, timeout=60)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertFalse((td / "out" / "summary.json").exists())
 
@@ -425,14 +405,9 @@ class SummaryWriterTests(unittest.TestCase):
     def setUp(self):
         self.summary = load(ROOT / "scripts" / "eval_summary.py")
 
-    def test_harness_and_native_counts(self):
+    def test_native_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
             td = Path(tmp)
-            (td / "LIBEROBenchmark_libero_goal_shard0of2.json").write_text(json.dumps(
-                {"tasks": [{"num_episodes": 2, "mean_success": 0.5}, {"num_episodes": 0}]}))
-            (td / "LIBEROBenchmark_libero_goal_shard1of2.json").write_text(json.dumps(
-                {"tasks": [{"num_episodes": 2, "mean_success": 1.0}]}))
-            self.assertEqual(self.summary.harness_counts(td), {"libero_goal": (3, 4)})
             (td / "libero_10").mkdir()
             for i, s in enumerate((1, 2)):
                 (td / "libero_10" / f"gpu0_task{i}_results.json").write_text(

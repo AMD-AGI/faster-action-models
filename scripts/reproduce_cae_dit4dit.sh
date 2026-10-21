@@ -8,16 +8,38 @@
 # the same configuration on AMD Instinct™ GPUs (--sim instinct) sits under it, commented out -- uncomment
 # it to run it. Results go under $REPRO_DIR (default eval/outputs/reproduce_cae_dit4dit).
 #
-# Environment: what each launcher's --help lists (LIBERO_ROOT, EVAL_IMAGE, EVAL_HARNESS, ROBOSUITE_OVERLAY,
+# Environment (MODEL_ZOO.md names every file): what each launcher's --help lists (LIBERO_ROOT, EVAL_IMAGE, ROBOSUITE_OVERLAY,
 # INSTINCT_SIM_BUILD for --sim instinct, ...), with the checkpoints named per model below:
-#   CAE_DIT4DIT_CKPT                              CAE-DiT4DiT (K8 x d48 latent-action) policy checkpoint
+#   CAE_DIT4DIT_CKPT                              CAE-DiT4DiT (K8 x d48 latent-action) policy checkpoint that you train
+#                                                (not released; docs/cae-dit4dit-robocasa.md)
+#
+# Runtime, approximate, per configuration on one AMD Instinct™ MI355X node (measured on our runs):
+#   DiT4DiT RoboCasa-GR1 full-24 (1,200 episodes): about 7 h on 2 GPUs with --clients-per-gpu 6 (--sim instinct);
+#   runs execute one after another, so the whole script takes many hours; run it under nohup or tmux.
+# The reference MI355X results were measured with --sim instinct: to match them, run the commented twins instead.
+# They are means over several full runs (each guide gives the count); a single run varies around the mean by about their spread.
+#
+# Flags: --help, --dry-run (print every resolved run without assets), --smoke (1 trial per task and one latency
+# round with the real checkpoints, under <default>-smoke), --only REGEX (only the launches whose command line
+# matches), --check (check the environment only).
+# Every variable above is checked before the first run starts.
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
-R="${REPRO_DIR:-eval/outputs/reproduce_cae_dit4dit}"
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+cd "$(dirname "$SELF")/.."
+# shellcheck source=scripts/reproduce_common.sh
+source scripts/reproduce_common.sh
+repro_init "$SELF" "$@"
+if [[ -z "${CAE_DIT4DIT_CKPT:-}" ]] && ((!REPRO_DRY_RUN)); then
+  echo "CAE_DIT4DIT_CKPT is not set. No CAE-DiT4DiT checkpoint is released: train your own with" >&2
+  echo "scripts/train_dit4dit_robocasa_action_vae.sh and scripts/train_dit4dit_robocasa_latent_policy.sh" >&2
+  echo "(docs/cae-dit4dit-robocasa.md), then set CAE_DIT4DIT_CKPT to the trained policy checkpoint." >&2
+fi
+repro_require CAE_DIT4DIT_CKPT ROBOSUITE_OVERLAY
+R="$(repro_dir eval/outputs/reproduce_cae_dit4dit)"
 mkdir -p "$R"
 
-cae_dit4dit() { DIT4DIT_ROBOCASA_CKPT="$CAE_DIT4DIT_CKPT" "$@"; }
+cae_dit4dit() { DIT4DIT_ROBOCASA_CKPT="${CAE_DIT4DIT_CKPT:-}" "$@"; }
 
 # DiT4DiT RoboCasa-GR1 full-24, CAE-DiT4DiT (Compact Action Expert)
-cae_dit4dit bash scripts/eval_dit4dit_robocasa.sh --sim mujoco --arm cae --full --output-dir "$R/dit4dit-robocasa-cae-mujoco"
-# cae_dit4dit bash scripts/eval_dit4dit_robocasa.sh --sim instinct --arm cae --full --output-dir "$R/dit4dit-robocasa-cae-instinct"
+cae_dit4dit run bash scripts/eval_dit4dit_robocasa.sh --sim mujoco --arm cae --full --output-dir "$R/dit4dit-robocasa-cae-mujoco"
+# cae_dit4dit run bash scripts/eval_dit4dit_robocasa.sh --sim instinct --arm cae --full --output-dir "$R/dit4dit-robocasa-cae-instinct"

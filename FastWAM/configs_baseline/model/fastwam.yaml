@@ -4,7 +4,13 @@ tokenizer_model_id: Wan-AI/Wan2.1-T2V-1.3B
 tokenizer_max_len: 128
 load_text_encoder: false
 proprio_dim: ${data.train.processor.proprio_output_dim}
-redirect_common_files: true
+# false: load the VAE and T5 encoder from the Wan-AI/Wan2.2-TI2V-5B files MODEL_ZOO.md downloads
+# (Wan2.2_VAE.pth, models_t5_umt5-xxl-enc-bf16.pth). true redirects them to the ModelScope-only
+# DiffSynth-Studio/Wan-Series-Converted-Safetensors copies. Both give the same model at the bf16 it runs in
+# (mixed_precision bf16): the converted T5 is identical, and the converted VAE is the bf16 rounding of the fp32
+# Wan2.2_VAE.pth, so the loaded bf16 weights, and the VAE and T5 outputs, are bitwise equal. Only an fp32 run
+# (mixed_precision "no") differs: false then keeps the full-precision VAE.
+redirect_common_files: false
 mot_checkpoint_mixed_attn: true
 action_dit_pretrained_path: checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt
 skip_dit_load_from_pretrain: false

@@ -58,6 +58,69 @@ class ReproduceScriptTests(unittest.TestCase):
                                            capture_output=True, text=True)
                         self.assertEqual(r.returncode, 0, r.stderr[-800:])
 
+    def test_help_dry_run_and_environment_check(self):
+        # --help prints the header, --dry-run resolves every launch without assets, and a run with
+        # nothing set fails the environment check before anything starts.
+        with tempfile.TemporaryDirectory() as out:
+            env = {"PATH": "/usr/bin:/bin", "HOME": out, "REPRO_DIR": out}
+            for name in SCRIPTS:
+                script = str(ROOT / "scripts" / name)
+                with self.subTest(script=name, flag="--help"):
+                    r = subprocess.run(["bash", script, "--help"], env=env, capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, r.stderr)
+                    self.assertIn("Runtime", r.stdout)
+                with self.subTest(script=name, flag="--dry-run"):
+                    r = subprocess.run(["bash", script, "--dry-run"], env=env, capture_output=True, text=True)
+                    self.assertEqual(r.returncode, 0, r.stderr[-800:])
+                with self.subTest(script=name, flag="none"):
+                    r = subprocess.run(["bash", script], env=env, capture_output=True, text=True, timeout=60)
+                    self.assertEqual(r.returncode, 2, r.stderr[-800:])
+                    self.assertIn("environment check failed", r.stderr)
+
+    def test_smoke_appends_smoke_to_every_launch_and_one_round_to_latency(self):
+        smoke_dir = ROOT / "eval" / "outputs" / "reproduce_cae_fastwam-smoke"
+        if not smoke_dir.exists():  # the script creates its default results directory; leave no trace
+            self.addCleanup(lambda: smoke_dir.is_dir() and not any(smoke_dir.iterdir()) and smoke_dir.rmdir())
+        with tempfile.TemporaryDirectory() as out:
+            env = {"PATH": "/usr/bin:/bin", "HOME": out}
+            r = subprocess.run(["bash", str(ROOT / "scripts" / "reproduce_cae_fastwam.sh"), "--dry-run", "--smoke"],
+                               cwd=out, env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            trials = re.findall(r"^trials=(\d+)$", r.stdout, re.M)
+            self.assertEqual(trials, ["1"] * 4, r.stdout)
+            outputs = re.findall(r"^output=(.*)$", r.stdout, re.M)
+            self.assertTrue(outputs)
+            for path in outputs:
+                self.assertIn("/eval/outputs/reproduce_cae_fastwam-smoke/", path)
+            latency = [l for l in r.stdout.splitlines() if l.startswith("dry run, not timing:")]
+            self.assertEqual(len(latency), 2)
+            for line in latency:
+                self.assertTrue(line.endswith("--rounds 1"), line)
+
+    def test_only_keeps_the_matching_launches(self):
+        with tempfile.TemporaryDirectory() as out:
+            env = {"PATH": "/usr/bin:/bin", "HOME": out, "REPRO_DIR": out}
+            r = subprocess.run(["bash", str(ROOT / "scripts" / "reproduce_cae_fastwam.sh"), "--dry-run",
+                                "--only", "arm cae|cae-fastwam"], env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr[-800:])
+            self.assertEqual(re.findall(r"^arm=(\w+)$", r.stdout, re.M), ["cae", "cae"])
+            self.assertEqual(r.stdout.count("skipped (--only"), 3)  # baseline, geak and the FastWAM latency
+            self.assertIn("dry run, not timing: python3 scripts/cae_fastwam_latency.py", r.stdout)
+
+    def test_latency_tools_time_on_the_first_gpu(self):
+        script = ('source scripts/reproduce_common.sh; REPRO_DRY_RUN=0; '
+                  'EVAL_GPUS=3,4,6 latency bash -c \'echo "gpus=$EVAL_GPUS $*"\' _ --x')
+        r = subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "gpus=3 --x")
+
+    def test_no_script_needs_a_harness(self):
+        for name in SCRIPTS + ("reproduce_common.sh",):
+            with self.subTest(script=name):
+                text = (ROOT / "scripts" / name).read_text()
+                self.assertNotIn("HARNESS", text.replace("DIT4DIT_HARNESS_ROOT", ""))
+                self.assertNotIn("vla-evaluation-harness", text)
+
 
 if __name__ == "__main__":
     unittest.main()

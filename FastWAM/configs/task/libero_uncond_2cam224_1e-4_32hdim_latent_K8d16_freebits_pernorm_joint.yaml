@@ -8,19 +8,29 @@ defaults:
 batch_size: 64
 num_workers: 8
 
+# Training data locations, relative to FastWAM/ (where the training scripts run). Override any of them on the
+# command line, e.g. `libero_data_root=/dev/shm` to read datasets staged in RAM (docs/cae-fastwam-libero.md).
+#   libero_data_root       holds libero_{spatial,object,goal,10}_no_noops_lerobot, extracted from the
+#                          yuanty/LIBERO-fastwam tarballs (LeRobot 2.1, as in data/libero_2cam.yaml)
+#   per_suite_stats_dir    libero_{suite}.json per-suite statistics (amd/CAE-FastWAM stats/)
+#   text_embeds_cache_dir  scripts/precompute_text_embeds.py output for this task
+libero_data_root: ./data/libero_mujoco3.3.2
+per_suite_stats_dir: ../checkpoints/CAE-FastWAM/stats
+text_embeds_cache_dir: ./data/text_embeds_cache/libero
+
 data:
   train:
     dataset_dirs:
-      - /dev/shm/libero_spatial_no_noops_lerobot
-      - /dev/shm/libero_object_no_noops_lerobot
-      - /dev/shm/libero_goal_no_noops_lerobot
-      - /dev/shm/libero_10_no_noops_lerobot
+      - ${libero_data_root}/libero_spatial_no_noops_lerobot
+      - ${libero_data_root}/libero_object_no_noops_lerobot
+      - ${libero_data_root}/libero_goal_no_noops_lerobot
+      - ${libero_data_root}/libero_10_no_noops_lerobot
     per_dataset_norm_stats:
-      - runs/per_suite_stats/dataset_stats_libero_spatial.json
-      - runs/per_suite_stats/dataset_stats_libero_object.json
-      - runs/per_suite_stats/dataset_stats_libero_goal.json
-      - runs/per_suite_stats/dataset_stats_libero_10.json
-    text_embedding_cache_dir: /dev/shm/text_embeds_cache_libero
+      - ${per_suite_stats_dir}/libero_spatial.json
+      - ${per_suite_stats_dir}/libero_object.json
+      - ${per_suite_stats_dir}/libero_goal.json
+      - ${per_suite_stats_dir}/libero_10.json
+    text_embedding_cache_dir: ${text_embeds_cache_dir}
 
 model:
   mot_checkpoint_mixed_attn: false

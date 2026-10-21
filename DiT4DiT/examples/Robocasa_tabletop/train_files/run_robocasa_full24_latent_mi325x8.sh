@@ -105,7 +105,7 @@ cd "${REPO_ROOT}"
 "${PYTHON_BIN}" \
   examples/Robocasa_tabletop/train_files/preflight_robocasa_full24.py \
   --repo-root "${REPO_ROOT}" \
-  --base-model "${REPO_ROOT}/Cosmos-Predict2.5-2B" \
+  --base-model "${COSMOS_BASE:-${REPO_ROOT}/Cosmos-Predict2.5-2B}" \
   --data-root "${DATA_ROOT_DIR}" \
   --output "${OUTPUT_DIR}/preflight.json" \
   --required-gpus "${NUM_PROCESSES}" \

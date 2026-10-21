@@ -14,7 +14,8 @@ Usage:
   bash scripts/train_fastwam_libero_action_vae.sh
 
 Required environment:
-  PREDECODED_ACTION_CACHE  Cached LIBERO actions with padding and suite IDs
+  PREDECODED_ACTION_CACHE  Cached LIBERO actions with padding and suite IDs, built by
+                           scripts/build_fastwam_action_cache.py (docs/cae-fastwam-libero.md#training-data)
   K8D16_VAE_OUTPUT        New output checkpoint path
 
 Optional environment:

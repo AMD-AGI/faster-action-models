@@ -245,3 +245,7 @@ __marimo__/
 /src/**/*.npz
 /src/**/*.pkl
 simulate/build-*/
+
+# Local downloads and checkouts made by following the docs
+/checkpoints/
+/third_party/

@@ -12,8 +12,6 @@ and the same per suite or per task) and prints one closing line:
 ("eval incomplete" when the launcher's run failed; the counts are then those of
 the episodes that finished). The result sources it reads:
 
-  --harness DIR    vla-evaluation-harness LIBEROBenchmark_*.json files (FastWAM
-                   harness launcher; DIR is the engine's cell directory)
   --native DIR     FastWAM evaluator <suite>/gpu*_task*_results.json files
   --counts K=S/E   counts the launcher tallied itself (DiT4DiT LIBERO), repeated
   --robocasa FILE  the full-24 summarizer's JSON output (DiT4DiT RoboCasa)
@@ -27,25 +25,6 @@ import sys
 from pathlib import Path
 
 SCHEMA_VERSION = 1
-
-
-def harness_counts(cell_dir: Path) -> dict[str, tuple[int, int]]:
-    """Per-suite (successes, episodes) of a harness cell directory."""
-    per: dict[str, list[float]] = {}
-    for path in sorted(cell_dir.glob("LIBEROBenchmark_*.json")):
-        try:
-            payload = json.loads(path.read_text())
-        except (OSError, ValueError):
-            continue
-        suite = path.name.split("LIBEROBenchmark_")[1].split("_sync")[0].split("_shard")[0]
-        for task in payload.get("tasks", []):
-            episodes = task.get("num_episodes", 0)
-            if not episodes:
-                continue
-            row = per.setdefault(suite, [0.0, 0])
-            row[0] += (task.get("mean_success") or 0.0) * episodes
-            row[1] += episodes
-    return {suite: (int(round(s)), int(n)) for suite, (s, n) in per.items()}
 
 
 def native_counts(out_dir: Path) -> dict[str, tuple[int, int]]:
@@ -131,16 +110,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--trials", type=int)
     ap.add_argument("--rc", type=int, default=0, help="the run's exit status (non-zero: incomplete)")
     source = ap.add_mutually_exclusive_group(required=True)
-    source.add_argument("--harness", type=Path)
     source.add_argument("--native", type=Path)
     source.add_argument("--counts", nargs="+")
     source.add_argument("--robocasa", type=Path)
     a = ap.parse_args(argv)
 
     try:
-        if a.harness is not None:
-            groups, kind = harness_counts(a.harness), "suite"
-        elif a.native is not None:
+        if a.native is not None:
             groups, kind = native_counts(a.native), "suite"
         elif a.counts is not None:
             groups, kind = parse_counts(a.counts), "suite"

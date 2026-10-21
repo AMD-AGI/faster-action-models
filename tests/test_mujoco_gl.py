@@ -75,6 +75,10 @@ class StubPython:
 
     def __init__(self, td: Path, stub: str):
         (td / "mujoco.py").write_text(textwrap.dedent(STUBS[stub]))
+        # An empty robosuite package shadows an installed robosuite, whose real EGL context the probe would
+        # otherwise also open: `robosuite.renderers` is then missing and the probe skips that context.
+        (td / "robosuite").mkdir(exist_ok=True)
+        (td / "robosuite" / "__init__.py").write_text("")
         self.prefix = [sys.executable]
         self.env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "PYTHONPATH": str(td),
                     "PYTHONNOUSERSITE": "1"}

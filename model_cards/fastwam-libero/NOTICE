@@ -8,4 +8,5 @@ fine-tuned by Advanced Micro Devices, Inc. using the FastWAM training recipe
 (https://github.com/yuantianyuan01/FastWAM, MIT License).
 
 Training data: LIBERO (Liu et al., NeurIPS 2023; CC BY 4.0), in the LeRobot
-format published as yuanty/LIBERO-fastwam (CC BY 4.0).
+format published as yuanty/LIBERO-fastwam (CC BY 4.0). The dataset is used as
+published. No extra training data was used beyond the FastWAM recipe.

@@ -18,6 +18,16 @@ def deprecated(old: str, new: str) -> None:
           file=sys.stderr)
 
 
+def extra_docker_args(environ=None) -> list[str]:
+    """EVAL_DOCKER_ARGS: extra `docker run` flags (shell-split), e.g. "--cpuset-cpus 104-127".
+
+    The latency tools add them to every container they start, so a timed container can be pinned to the
+    CPUs of its GPU's NUMA node, away from other work on the node.
+    """
+    import shlex
+    return shlex.split((environ if environ is not None else os.environ).get("EVAL_DOCKER_ARGS", ""))
+
+
 def resolve_one_gpu(gpus: str | None, gpu: str | None = None) -> str:
     """--gpus (default EVAL_GPUS, else 0) for a tool that runs on one GPU.
 

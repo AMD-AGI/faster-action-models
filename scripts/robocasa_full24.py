@@ -350,15 +350,25 @@ def run_share(segment: Segment, *, port: int, args, dit4dit_root: Path, dirs: di
         task_video_dir = dirs["videos"] / segment.task.label
         task_video_dir.mkdir(parents=True, exist_ok=True)
         command.extend(["--args.video-out-path", str(task_video_dir)])
-    with (dirs["logs"] / f"{segment.stem}.log").open("w") as log_file:
-        subprocess.run(
-            command,
-            cwd=dit4dit_root,
-            env=client_environment(args, dit4dit_root),
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            check=True,
-        )
+    log_path = dirs["logs"] / f"{segment.stem}.log"
+    with log_path.open("w") as log_file:
+        try:
+            subprocess.run(
+                command,
+                cwd=dit4dit_root,
+                env=client_environment(args, dit4dit_root),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            # A client that dies on a signal (a native crash in the simulator stack, say) leaves no Python
+            # traceback for the driver to show; print the end of its log with the failure.
+            log_file.flush()
+            lines = log_path.read_text(errors="replace").splitlines()[-40:]
+            print(f"client {segment.stem} failed ({exc}); last lines of {log_path}:\n" + "\n".join(lines),
+                  file=sys.stderr, flush=True)
+            raise
 
 
 def result_is_complete(path: Path, task, args, matching) -> bool:

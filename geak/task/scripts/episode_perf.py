@@ -63,7 +63,10 @@ def load_model():
     with initialize_config_dir(version_base="1.3", config_dir=CONFIG_DIR):
         cfg = compose(
             config_name="sim_libero",
-            overrides=[f"ckpt={CKPT}", "model.load_text_encoder=false"],
+            # redirect_common_files=false: load the VAE from the Wan-AI files MODEL_ZOO.md downloads rather than
+            # the ModelScope-only DiffSynth copies FastWAM/configs/model/*.yaml redirect to by default; at the bf16
+            # the model is built in, both give bitwise-identical weights (see FastWAM/configs_baseline/model/fastwam.yaml).
+            overrides=[f"ckpt={CKPT}", "model.load_text_encoder=false", "++model.redirect_common_files=false"],
         )
     model = instantiate(cfg.model, model_dtype=torch.bfloat16, device="cuda")
     model.load_checkpoint(str(cfg.ckpt))

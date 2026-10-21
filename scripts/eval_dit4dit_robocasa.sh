@@ -120,9 +120,16 @@ DETERMINISM
 
 Required environment:
   DIT4DIT_ROBOCASA_CKPT  Policy checkpoint for the selected arm (see --arm).
-                         The DiT4DiT authors' checkpoint's run_dir config.yaml
-                         must point framework.cosmos.base_model at a local
-                         Cosmos-Predict2.5-2B.
+                         baseline/geak: the DiT4DiT authors' checkpoint,
+                         mondo-robotics/dit4dit-model
+                         dit4dit_robocasa_gr1/final_model/pytorch_model.pt;
+                         cae: the CAE-DiT4DiT checkpoint you train (not
+                         released; docs/cae-dit4dit-robocasa.md). The run
+                         directory's config.yaml (above final_model/ or
+                         checkpoints/) must point
+                         framework.cosmos25.base_model at a local copy of the
+                         gated nvidia/Cosmos-Predict2.5-2B (accept its licence
+                         on Hugging Face and log in to download it).
   ROBOSUITE_OVERLAY      Pinned robosuite 1.5.1 site-packages overlay
 
 Optional environment:
@@ -146,6 +153,8 @@ Optional environment:
   EVAL_GPUS              Default for --gpus
   EVAL_OUTPUT_ROOT       Default for --output-dir
   PORT                   Default for --port (8098)
+  NUMBA_OPT              Set to 0 for the clients on AMD Zen 5 hosts unless
+                         exported (numba 0.61 segfaults optimizing for them)
 EOF
 }
 
@@ -427,6 +436,15 @@ declare -a evaluation=(
 )
 if [[ "$record_video" -eq 1 ]]; then
   evaluation+=(--record-video)
+fi
+
+# numba 0.61 / llvmlite 0.44 (pinned by robocasa-gr1) do not know AMD Zen 5 CPUs (family 26, the EPYC hosts of
+# MI350X/MI355X systems): optimizing robosuite's @njit transforms segfaults every RoboCasa client, on both
+# simulators. NUMBA_OPT=0 compiles them unoptimized; an exported NUMBA_OPT is kept.
+if [[ -z "${NUMBA_OPT:-}" ]] && grep -q '^vendor_id[[:space:]]*: AuthenticAMD' /proc/cpuinfo 2>/dev/null \
+  && grep -qE '^cpu family[[:space:]]*: 26$' /proc/cpuinfo 2>/dev/null; then
+  echo "AMD Zen 5 host CPU: setting NUMBA_OPT=0 for the RoboCasa clients (numba 0.61 cannot optimize for it)"
+  export NUMBA_OPT=0
 fi
 
 if [[ "$sim" == instinct ]]; then

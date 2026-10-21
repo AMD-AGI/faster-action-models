@@ -47,6 +47,9 @@ DIFFUSERS OVERLAYS
 
 --gpus takes the one HIP device to time on (default: EVAL_GPUS, else 0); the
 former --gpu still works with a deprecation warning.
+EVAL_DOCKER_ARGS adds `docker run` flags to every timed container, e.g.
+EVAL_DOCKER_ARGS="--cpuset-cpus 104-127" pins it to the CPUs of the GPU's NUMA node
+(the reference latency runs pinned each container that way, away from other work).
 
 ENVIRONMENT
   required  DIT4DIT_LIBERO_CKPT    DiT4DiT LIBERO checkpoint (--bench libero)
@@ -66,6 +69,12 @@ ENVIRONMENT
                                    transformers and tokenizers versions in its result.
             HF_HOME HF_CACHE_DIR HUGGINGFACE_HUB_CACHE TORCH_HOME XDG_CACHE_HOME
             HF_HUB_OFFLINE TRANSFORMERS_OFFLINE   forwarded to the container when set
+
+RECIPE  The evaluation image (docker/Dockerfile.eval) works as EVAL_IMAGE with two variables pointing
+  into the environments DiT4DiT/environments/setup_dit4dit_rocm_envs.sh builds (OUT_DIR envs/):
+    pip install --no-deps --target envs/d4pins transformers==4.57.6 tokenizers==0.22.2   # inside the image
+    export DIT4DIT_DIFFUSERS_SRC=$PWD/envs/model/lib/python3.12/site-packages/diffusers  # diffusers 3996788
+    export DIT4DIT_PYOVERLAY=$PWD/envs/pyoverlay:$PWD/envs/d4pins
 
 Absolute paths named in the checkpoint's run-directory config.yaml (the local
 Cosmos-Predict2.5-2B base model) are mounted read-only into the container.
@@ -87,7 +96,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from eval_flags import resolve_one_gpu  # noqa: E402  (scripts/eval_flags.py)
+from eval_flags import extra_docker_args, resolve_one_gpu  # noqa: E402  (scripts/eval_flags.py)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKER = os.path.join(REPO, "scripts", "dit4dit_latency_worker.py")
@@ -268,7 +277,7 @@ def docker_argv(name: str, steps: int, gpu: str, env: dict, work: str, ckpt: str
              "--env", "PYTHONPATH=" + ":".join(pythonpath),
              "--env", "PYTHONNOUSERSITE=1", "--env", "PYTHONUNBUFFERED=1",
              "--env", "PYTHONDONTWRITEBYTECODE=1",
-             "--workdir", tree, env["EVAL_IMAGE"]]
+             ] + extra_docker_args(env) + ["--workdir", tree, env["EVAL_IMAGE"]]
     return args
 
 
@@ -295,7 +304,7 @@ def build_overlays(names, env: dict, a) -> bool:
             print(f"  overlay build for {n} timed out", file=sys.stderr)
             return False
         if p.returncode != 0:
-            tail = "\n".join((p.stdout + p.stderr).splitlines()[-15:])
+            tail = "\n".join((p.stdout + p.stderr).splitlines()[-60:])
             print(f"  overlay build for {n} failed (rc={p.returncode})\n{tail}", file=sys.stderr)
             return False
     return True
@@ -315,7 +324,7 @@ def measure(bench: str, name: str, steps: int, a, env: dict, ckpt: str) -> dict 
         if line.startswith("RESULT "):
             result = json.loads(line[len("RESULT "):])
     if p.returncode != 0 or result is None:
-        tail = "\n".join((p.stdout + p.stderr).splitlines()[-15:])
+        tail = "\n".join((p.stdout + p.stderr).splitlines()[-60:])
         print(f"  [{name}@{steps}] failed (rc={p.returncode})\n{tail}", file=sys.stderr)
         return None
     return result

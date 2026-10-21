@@ -10,42 +10,16 @@ encoded on the client), so leave it off for timed or full-protocol runs.
 |---|---|---|---|---|
 | DiT4DiT / LIBERO | `scripts/eval_dit4dit_libero.sh` | always on (`--record-video` accepted, no-op) | `<output-dir>/videos/<suite>[_task<T>]/` | `rollout_<task>_episode<i>_{success,failure}.mp4`, 10 fps |
 | DiT4DiT / RoboCasa-GR1 full-24 (every arm) | `scripts/eval_dit4dit_robocasa.sh` | `--record-video` | `<output-dir>/videos/<task>/` | `<uuid>_success{0,1}.mp4`, 10 fps |
-| FastWAM / LIBERO (all arms) | `scripts/eval_fastwam_libero.sh` | `--record-video` | `<output-dir>/<cell>/videos/<suite>/` | `task<N>_ep<NNN>.mp4`, 20 fps, agent view |
-| FastWAM / LIBERO, native evaluator (all arms) | `eval/native/run_fastwam_libero.sh --mode serial` | always on (`--record-video` accepted, no-op; `--mode batched` writes none and refuses it) | `<output-dir>/<suite>/videos/` | `<time>--episode=task<T>_trial<i>--success=<bool>--task=<description>.mp4`, 24 fps |
+| FastWAM / LIBERO (all arms) | `eval/native/run_fastwam_libero.sh --mode serial` (and its wrapper `scripts/eval_fastwam_libero.sh`) | always on (`--record-video` accepted, no-op; `--mode batched` writes none and refuses it) | `<output-dir>/<suite>/videos/` | `<time>--episode=task<T>_trial<i>--success=<bool>--task=<description>.mp4`, 24 fps |
 
-`<cell>` is the engine's result directory: `<arm>_<N>step` (`baseline_10step`,
-`geak_2step`), and `cae_<N>step` for `--arm cae`.
+For every launcher the outcome is part of the file name, so selecting a success
+or a failure is a `ls`.
 
-For the DiT4DiT launchers and the native FastWAM evaluator the outcome is part
-of the file name, so selecting a success or a failure is a `ls`.
-
-## FastWAM harness specifics
-
-`--record-video` sets `save_video_dir` on the evaluation harness's LIBERO
-benchmark. Not every harness revision has that parameter. `eval/run_eval.sh`
-and `eval/run_eval_cae_fastwam.sh` check for it and stop with exit code 2 instead of
-silently recording nothing. If `imageio` is missing from the client image,
-the harness writes `.npz` frame stacks (`frames`, `[T, H, W, 3]` uint8)
-instead of `.mp4`.
-
-The file name carries no outcome. Also, **do not trust the `task<N>` in it**:
-`<NNN>` is a per-client running counter, and when one shard runs several tasks
-the task id can be stale. Map files to episodes through the shard logs instead:
-
-1. `shard<k>.log` in the arm's output directory prints one
-   `[VID] wrote <path> (<frames> frames)` line per episode, in the order the
-   episodes ran.
-2. `LIBEROBenchmark_<suite>_shard<k>of<n>.json` lists the same episodes, in
-   the same order, under `tasks[].episodes[]`, with `metrics.success` and
-   `steps`.
-3. Pair them in order. The frame count equals the episode's `steps`, which
-   confirms the pairing.
-
-Example, the CAE-FastWAM cell on one suite with videos:
+Example, the CAE-FastWAM cell on one suite (FastWAM's evaluator writes one video
+per episode):
 
 ```bash
-bash scripts/eval_fastwam_libero.sh --arm cae \
-    --suites libero_spatial --record-video
+bash eval/native/run_fastwam_libero.sh --arm cae --suites libero_spatial --gpus 0
 ```
 
 ## Reproducing a figure

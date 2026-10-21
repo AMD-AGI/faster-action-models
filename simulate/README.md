@@ -1,7 +1,9 @@
 # GPU-native simulation (`--sim instinct`)
 
-This directory is the `simulate/` backend: a GPU-native physics engine and ray tracer for AMD Instinct™ GPUs
-(gfx950 / gfx942), used by the launchers with `--sim instinct`. It reads MuJoCo
+This directory is the `simulate/` backend: a GPU-native physics engine and ray tracer for AMD Instinct™
+MI350X/MI355X GPUs (gfx950), used by the launchers with `--sim instinct`. gfx950 is the only supported target:
+several kernels need more local memory (LDS) than MI300X/MI325X (gfx942) provide, so the build fails there. On
+MI300X/MI325X, and on any other GPU, use `--sim mujoco` (CPU physics, the launchers' default). It reads MuJoCo
 MJCF models and follows MuJoCo 3.3.2 semantics. This directory holds the part that the closed-loop evaluations in
 this repository need. It swaps in for **physics and camera rendering** behind the benchmarks' own code. Scenes,
 resets, init states, observation keys and success checks stay LIBERO's and RoboCasa's. The
@@ -18,17 +20,22 @@ Contents, build presets and third-party code: [`PROVENANCE.md`](PROVENANCE.md).
 ## Build
 
 The build produces a Python extension (`instinct_sim`). It must be compiled against the Python and ROCm runtime
-of the image that runs the simulator clients. Build it there, with the ROCm devel wheel added:
+of the image that runs the simulator clients. Build it there, with the ROCm devel wheel added. With this repository's
+recipes every client runs in the evaluation image ([`docker/Dockerfile.eval`](../docker/Dockerfile.eval), Python 3.12,
+ROCm 7.14): the FastWAM and DiT4DiT LIBERO clients use its Python, and the RoboCasa client environment
+(`ROBOCASA_PYTHON`, from [`DiT4DiT/environments/setup_dit4dit_rocm_envs.sh`](../DiT4DiT/environments/setup_dit4dit_rocm_envs.sh))
+is a venv on the same interpreter. So build both presets against that image:
 
 ```bash
+docker build -f docker/Dockerfile.eval -t fam-eval:rocm7.14 .
 # build image = the sim client image + rocm-sdk-devel + pybind11 (the run image itself is not modified)
-docker build -f simulate/docker/Dockerfile.build --build-arg BASE=<sim client image> -t instinct-sim-build simulate/docker
+docker build -f simulate/docker/Dockerfile.build --build-arg BASE=fam-eval:rocm7.14 -t instinct-sim-build simulate/docker
 docker run --rm -v "$PWD:$PWD" -w "$PWD" instinct-sim-build bash simulate/build.sh libero   build/instinct-sim-libero
 docker run --rm -v "$PWD:$PWD" -w "$PWD" instinct-sim-build bash simulate/build.sh robocasa build/instinct-sim-robocasa
 ```
 
 The two presets are the exact flags used for the evaluations (`PROVENANCE.md`). `HIP_ARCH` overrides the GPU
-target (default `gfx950`). The scripts take the build directory as `INSTINCT_SIM_BUILD`.
+target (default and only supported value: `gfx950`). The scripts take the build directory as `INSTINCT_SIM_BUILD`.
 
 ## Use
 
@@ -40,7 +47,9 @@ export LD_LIBRARY_PATH=$INSTINCT_SIM_BUILD:$LD_LIBRARY_PATH   # plus the ROCm ru
 python -m instinct_sim_libero.run path/to/eval_libero.py --its --own --args
 ```
 
-RoboCasa: the client needs `mujoco==3.3.2` on `PYTHONPATH` ahead of the image's 3.2.6. `instinct_sim_robocasa.compat`
+RoboCasa: the client needs `mujoco==3.3.2` on `PYTHONPATH` ahead of its environment's 3.2.6
+(`INSTINCT_SIM_MUJOCO_PATH` for `scripts/eval_dit4dit_robocasa.sh`; `setup_dit4dit_rocm_envs.sh` installs it with
+`pip install --target`). `instinct_sim_robocasa.compat`
 lets robocasa import under it.
 
 ```bash

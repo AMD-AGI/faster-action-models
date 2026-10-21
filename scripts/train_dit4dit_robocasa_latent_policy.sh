@@ -66,7 +66,8 @@ if [[ "$PYTHON_BIN" == */* ]]; then
     echo "DIT4DIT_PYTHON must name an executable: $PYTHON_BIN" >&2
     exit 2
   }
-  PYTHON_BIN="$(realpath "$PYTHON_BIN")"
+  # Absolute, but symlinks kept: a virtualenv's bin/python is a symlink, and resolving it drops the venv.
+  PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd)/$(basename "$PYTHON_BIN")"
 else
   command -v "$PYTHON_BIN" >/dev/null || {
     echo "DIT4DIT_PYTHON is not on PATH: $PYTHON_BIN" >&2

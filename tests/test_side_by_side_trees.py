@@ -184,28 +184,29 @@ class TreeLayoutTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
 
-class RunEvalGuardTests(unittest.TestCase):
+class NativeLauncherArmTests(unittest.TestCase):
+    """eval/native/run_fastwam_libero.sh maps each arm to a whole tree, and the harness engines are gone."""
+
     def setUp(self):
-        self.script = (ROOT / "eval" / "run_eval.sh").read_text()
+        self.script = (ROOT / "eval" / "native" / "run_fastwam_libero.sh").read_text()
 
-    def test_optimized_src_fallback_is_guarded(self):
-        self.assertIn("OPTIMIZED_SRC_DEFAULTED", self.script)
-        self.assertIn("refusing to run BASELINE_SRC under an optimized_Nstep label", self.script)
+    def test_each_arm_is_a_whole_tree(self):
+        for arm, tree in (("baseline", "src/fastwam-baseline"), ("geak", "src/fastwam-geak"),
+                          ("cae", "src/cae-fastwam")):
+            self.assertIn(f"{arm}) SRC={tree} ;;", self.script)
 
-    def test_gpu_pool_is_overridable(self):
-        self.assertIn("EVAL_GPUS", self.script)
-        self.assertIn("--gpus)", self.script)
-        self.assertNotIn("GPUS=(0 1 2 3)", self.script)
+    def test_compile_caches_are_per_worker_and_forwarded(self):
+        self.assertIn('-e "TORCHINDUCTOR_CACHE_DIR=$cache/inductor" -e "TRITON_CACHE_DIR=$cache/triton"', self.script)
+        self.assertIn("geak) ARMENV=(-e FASTWAM_KVSLAB=0)", self.script)
 
-    def test_compile_cache_dirs_are_forwarded(self):
-        # An unforwarded path variable is a silent no-op.
-        for variable in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
-            self.assertIn(variable, self.script)
-
-    def test_run_eval_never_learns_the_word_geak(self):
-        # scripts/compare_artifacts.py owns the name `geak`; run_eval.sh owns
-        # `optimized`. Exactly one wrapper translates between them.
-        self.assertNotIn("geak", self.script)
+    def test_no_policy_server_engine_remains(self):
+        for name in ("run_eval.sh", "run_eval_cae_fastwam.sh"):
+            self.assertFalse((ROOT / "eval" / name).exists(), name)
+        for path in [ROOT / "scripts" / "eval_fastwam_libero.sh", ROOT / "docker" / "Dockerfile.eval",
+                     ROOT / "geak" / "task" / "run_local.sh", ROOT / "geak" / "task" / "scripts" / "task_runner.py"]:
+            text = path.read_text()
+            for word in ("vla_eval", "vla-evaluation-harness", "EVAL_HARNESS", "run_eval"):
+                self.assertNotIn(word, text, f"{path.name}: {word}")
 
 
 class MatrixRefusalTests(unittest.TestCase):
@@ -226,9 +227,9 @@ class MatrixRefusalTests(unittest.TestCase):
                 result = self.run_script(name, "--help")
                 self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_cae_fastwam_engine_help_exits_zero(self):
+    def test_native_fastwam_help_exits_zero(self):
         result = subprocess.run(
-            ["bash", str(ROOT / "eval" / "run_eval_cae_fastwam.sh"), "--help"],
+            ["bash", str(ROOT / "eval" / "native" / "run_fastwam_libero.sh"), "--help"],
             capture_output=True,
             text=True,
         )
@@ -281,7 +282,7 @@ class UnifiedFlagTests(unittest.TestCase):
         common = ("--arm", "--steps", "--sim", "--gpus", "--smoke", "--full",
                   "--trials", "--output-dir", "--record-video", "--dry-run", "-h, --help")
         extra = {
-            "fastwam": ("--suites", "--clients-per-gpu", "--port"),
+            "fastwam": ("--suites", "--mode"),
             "native": ("--suites",),
             "dit4dit-libero": ("--suites", "--clients-per-gpu", "--port"),
             "dit4dit-robocasa": ("--clients-per-gpu", "--port"),
@@ -302,7 +303,6 @@ class UnifiedFlagTests(unittest.TestCase):
             ("dit4dit-libero", ("--gpu", "0"), "--gpu", None),
             ("dit4dit-libero", ("--parallel-tasks", "2"), "--parallel-tasks", None),
             ("dit4dit-libero", (), "GPU_ID", {"GPU_ID": "0"}),
-            ("fastwam", ("--shards", "5"), "--shards", None),
             ("dit4dit-robocasa", ("--dry-run", "--episodes", "10"), "--episodes", None),
             ("dit4dit-robocasa", ("--dry-run",), "EPISODES", {"EPISODES": "10"}),
             ("dit4dit-robocasa", ("--dry-run",), "DIT4DIT_GPU_LIST", {"DIT4DIT_GPU_LIST": "0,1"}),
@@ -331,18 +331,24 @@ class UnifiedFlagTests(unittest.TestCase):
         self.assertIn("9101", result.stdout)
 
     def test_single_server_launchers_take_one_gpu(self):
-        for name in ("fastwam", "dit4dit-libero"):
-            with self.subTest(launcher=name):
-                result = self.run_launcher(name, "--gpus", "0,1")
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertIn("runs one policy server; pass one GPU id", result.stderr)
+        result = self.run_launcher("dit4dit-libero", "--gpus", "0,1")
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("runs one policy server; pass one GPU id", result.stderr)
 
-    def test_fastwam_harness_takes_sim_and_output_dir(self):
+    def test_fastwam_wrapper_takes_sim_gpus_and_output_dir(self):
         result = self.run_launcher("fastwam", "--sim", "mujoco", "--output-dir", "/tmp/x", "--gpus", "3")
         self.assertIn("MODEL_CKPT", result.stderr)
-        result = self.run_launcher("fastwam", "--sim", "instinct")
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertIn("eval/native/run_fastwam_libero.sh --sim instinct", result.stderr)
+        result = self.run_launcher("fastwam", "--sim", "instinct", "--gpus", "0,1", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("sim=instinct", result.stdout)
+        self.assertIn("gpus=0,1", result.stdout)
+        result = self.run_launcher("fastwam", "--dry-run")
+        self.assertIn("gpus=0\n", result.stdout)  # the wrapper's one-GPU default
+        for flag in ("--shards", "--port", "--clients-per-gpu"):
+            with self.subTest(flag=flag):
+                result = self.run_launcher("fastwam", flag, "5")
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertIn("runs no policy server", result.stderr)
 
     def test_native_launcher_flags(self):
         cases = (
@@ -526,7 +532,8 @@ class AdvertisedCellTests(unittest.TestCase):
     def test_no_one_liner_offers_a_one_step_fastwam_cell(self):
         for line in self.DOC.read_text().splitlines():
             stripped = line.strip()
-            if not stripped.startswith("bash scripts/eval_fastwam_libero.sh"):
+            if not stripped.startswith(("bash scripts/eval_fastwam_libero.sh",
+                                        "bash eval/native/run_fastwam_libero.sh")):
                 continue
             self.assertNotIn("--steps 1 ", stripped + " ", stripped)
 
@@ -539,7 +546,7 @@ class AdvertisedCellTests(unittest.TestCase):
         checked = 0
         for line in self.DOC.read_text().splitlines():
             stripped = line.strip()
-            m = re.match(r"^bash (scripts/\S+\.sh) (.*)$", stripped)
+            m = re.match(r"^bash ((?:scripts|eval/native)/\S+\.sh) (.*)$", stripped)
             if not m:
                 continue
             script, rest = m.group(1), m.group(2)
@@ -548,8 +555,10 @@ class AdvertisedCellTests(unittest.TestCase):
             # Pass the WHOLE documented argument list: --steps is only half a
             # cell, and --arm decides whether the other half is offered.
             with self.subTest(command=stripped):
+                # --dry-run: past flag validation, nothing starts (the native launcher would
+                # otherwise need its assets before it could refuse anything else).
                 result = subprocess.run(
-                    ["bash", str(ROOT / script), *shlex.split(rest)],
+                    ["bash", str(ROOT / script), *shlex.split(rest), "--dry-run"],
                     capture_output=True, text=True, env={"PATH": "/usr/bin:/bin"},
                 )
                 self.assertNotIn("not a DiT4DiT cell", result.stderr)

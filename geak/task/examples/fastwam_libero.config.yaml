@@ -95,11 +95,11 @@ prompt:
 
     *** CORRECTNESS: TWO GATES, BOTH MUST PASS ***
     A numerics oracle runs first as a cheap pre-filter, then real MuJoCo LIBERO
-    episodes against a persistent model server. THE ROLLOUT IS THE AUTHORITY.
+    episodes on one persistent model (FastWAM's evaluator). THE ROLLOUT IS THE AUTHORITY.
 
     The oracle replays ONE input, so it is structurally blind to cross-episode
-    state staleness -- exactly what caching and graph capture introduce. The eval
-    server reuses ONE model across episodes and calls prefill with a NEW video
+    state staleness -- exactly what caching and graph capture introduce. The
+    evaluator reuses ONE model across episodes and calls prefill with a NEW video
     each time. Therefore: any state cached on `self` (KV buffers, captured
     graphs, static input/output buffers) MUST be invalidated when the incoming
     video cache changes. Invalidate by COUNTER, never by data_ptr/_version

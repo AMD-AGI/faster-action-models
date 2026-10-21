@@ -48,10 +48,9 @@ terms.
 | LIBERO in LeRobot format | FastWAM training | [yuanty/LIBERO-fastwam](https://huggingface.co/datasets/yuanty/LIBERO-fastwam) | CC BY 4.0 |
 | PhysicalAI-Robotics-GR00T-X-Embodiment-Sim | DiT4DiT training | [nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim](https://huggingface.co/datasets/nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim) | CC BY 4.0 |
 | RoboCasa kitchen assets | RoboCasa simulation | [robocasa/robocasa](https://github.com/robocasa/robocasa) (`download_kitchen_assets.py`) | CC BY 4.0 per upstream; includes Objaverse objects with per-object licenses (code: MIT) |
-| RoboCasa-GR1 tabletop assets | RoboCasa-GR1 evaluation | [nvidia/PhysicalAI-DigitalCousin-Assets](https://huggingface.co/datasets/nvidia/PhysicalAI-DigitalCousin-Assets) | **CC BY-NC 4.0 (non-commercial)** (task code [robocasa-gr1-tabletop-tasks](https://github.com/robocasa/robocasa-gr1-tabletop-tasks): MIT) |
+| RoboCasa-GR1 tabletop assets | RoboCasa-GR1 evaluation | [nvidia/PhysicalAI-DigitalCousin-Assets](https://huggingface.co/datasets/nvidia/PhysicalAI-DigitalCousin-Assets) (`download_groot_assets.py`) | **CC BY-NC 4.0 (non-commercial)** (task code [robocasa-gr1-tabletop-tasks](https://github.com/robocasa/robocasa-gr1-tabletop-tasks): MIT) |
 | robosuite | Simulation framework | [ARISE-Initiative/robosuite](https://github.com/ARISE-Initiative/robosuite) | MIT |
 | MuJoCo | Physics engine | [google-deepmind/mujoco](https://github.com/google-deepmind/mujoco) | Apache-2.0 |
-| vla-evaluation-harness | FastWAM LIBERO closed-loop evaluation | [allenai/vla-evaluation-harness](https://github.com/allenai/vla-evaluation-harness) | Apache-2.0 |
 | GEAK | GEAK kernel optimization | [AMD-AGI/GEAK](https://github.com/AMD-AGI/GEAK) | Apache-2.0 |
 
 ## 3. Model checkpoints

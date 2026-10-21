@@ -118,7 +118,13 @@ HOW --steps IS PLUMBED
   artifact; the read-back assertion is what makes that impossible.
 
 Required environment:
-  DIT4DIT_LIBERO_CKPT    DiT4DiT LIBERO checkpoint
+  DIT4DIT_LIBERO_CKPT    DiT4DiT LIBERO checkpoint: mondo-robotics/dit4dit-model
+                         dit4dit_libero/final_model/pytorch_model.pt. The
+                         config.yaml above final_model/ must point
+                         framework.cosmos25.base_model at a local copy of the
+                         gated nvidia/Cosmos-Predict2.5-2B (accept its licence
+                         on Hugging Face and log in to download it;
+                         docs/cae-dit4dit-robocasa.md#cosmos-predict25-2b).
   DIT4DIT_MODEL_PYTHON   Python in the DiT4DiT model environment (a path, or a
                          name on PATH; default: DIT4DIT_PYTHON)
   DIT4DIT_LIBERO_PYTHON  Python in the LIBERO simulator environment (default:
@@ -139,6 +145,10 @@ Optional environment:
                          (default: the model environment's installed diffusers;
                          required when that environment ships no diffusers)
   DIT4DIT_PYOVERLAY      Third-party wheel overlay added to PYTHONPATH
+  TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD
+                         Set to 1 for the LIBERO clients unless exported:
+                         LIBERO's init-state files need a full torch.load on
+                         PyTorch >= 2.6
 EOF
 }
 
@@ -289,7 +299,7 @@ if ((dry_run)); then
   eval_dry_run "model=dit4dit" "benchmark=libero" "arm=${arm}" \
     "tree=$(realpath -m "$DIT4DIT_ROOT")" "steps=${steps}" "trials=${trials}" "suites=${suites_csv}" \
     "gpus=${gpu}" "port=${port}" "clients_per_gpu=${clients_per_gpu}" "sim=${sim}" \
-    "mujoco_gl=$([[ "$sim" == instinct ]] && echo "${MUJOCO_GL:-unset} (unchanged under --sim instinct)" \
+    "mujoco_gl=$([[ "$sim" == instinct ]] && echo "osmesa (--sim instinct helper contexts)" \
       || eval_mujoco_gl_dry_run)" \
     "record_video=1 (always)" "output=$(realpath -m "$output_dir")"
 fi
@@ -333,8 +343,13 @@ libero_root="$(realpath "$libero_root")"
 DIT4DIT_ROOT="$(realpath "$DIT4DIT_ROOT")"
 # CPU MuJoCo renders with GPU OpenGL (EGL) when the client interpreter can
 # create an EGL context in the client's environment (its GPU and PYTHONPATH),
-# else with OSMesa; an exported MUJOCO_GL is kept. --sim instinct leaves the
-# environment as it is: the GPU simulator renders the cameras.
+# else with OSMesa; an exported MUJOCO_GL is kept. Under --sim instinct the GPU
+# simulator renders the cameras and robosuite's helper MuJoCo contexts take
+# OSMesa, as in scripts/eval_dit4dit_robocasa.sh: left unset, robosuite would
+# pick EGL, which fails on GPUs without a graphics engine (EGL_BAD_ALLOC).
+if [[ "$sim" == instinct ]]; then
+  eval_mujoco_gl_instinct
+fi
 if [[ "$sim" == mujoco ]]; then
   eval_mujoco_gl env CUDA_VISIBLE_DEVICES="$gpu" HIP_VISIBLE_DEVICES="$gpu" \
     PYTHONPATH="${DIT4DIT_ROOT}:${libero_root}${DIT4DIT_PYOVERLAY:+:${DIT4DIT_PYOVERLAY}}:${PYTHONPATH:-}" \
@@ -441,6 +456,9 @@ run_libero_client() {
     export CUDA_VISIBLE_DEVICES="$gpu"
     export HIP_VISIBLE_DEVICES="$gpu"
     export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-${HOME}/.libero}"
+    # LIBERO loads its own init-state files with a bare torch.load; PyTorch >= 2.6 defaults to
+    # weights_only=True, which rejects them (the FastWAM evaluator passes weights_only=False instead).
+    export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD="${TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD:-1}"
     export PYTHONPATH="${DIT4DIT_ROOT}:${libero_root}${DIT4DIT_PYOVERLAY:+:${DIT4DIT_PYOVERLAY}}:${PYTHONPATH:-}"
     if [[ "$sim" == instinct ]]; then instinct_sim_client_env libero "$libero_python"; fi
     "$libero_python" examples/LIBERO/eval_files/eval_libero.py \

@@ -22,7 +22,9 @@ are downloaded by the setup script, never redistributed. See
 The 200K-step policy is evaluated across the complete 24-family RoboCasa-GR1
 task set, with 50 episodes per family, at seed 7 under the pinned reproduction
 stack. This is not an exact replay of the original DiT4DiT runs and not a
-multi-seed evaluation. Results are reported in the accompanying blog post.
+multi-seed evaluation. The reported 56.8% comes from a single run of
+AMD's own CAE-DiT4DiT checkpoint, which is not released, on an AMD Instinct™ MI355X GPU with
+`--sim instinct`; a checkpoint you train yourself will not match it exactly.
 
 The evaluation contract is:
 
@@ -47,7 +49,8 @@ export ACTION_VAE="${REPO_ROOT}/playground/action_vae/full24_sweep/k8d48h256_non
 # statistics step below (also the native policy launcher's default path).
 export POLICY_STATS="${REPO_ROOT}/playground/Checkpoints_robocasa/benchmark_full24_b16_eager/dataset_statistics.json"
 # Written by the policy training step (scripts/train_dit4dit_robocasa_latent_policy.sh).
-export POLICY_200K="${REPO_ROOT}/playground/Checkpoints_robocasa/dit4dit_robocasa_full24_latent_k8_d48_mi325x8_b16_opt_s42/checkpoints/steps_200000_pytorch_model.pt"
+# (Earlier versions of this guide called it POLICY_200K; the launcher still accepts that name.)
+export CAE_DIT4DIT_CKPT="${REPO_ROOT}/playground/Checkpoints_robocasa/dit4dit_robocasa_full24_latent_k8_d48_mi325x8_b16_opt_s42/checkpoints/steps_200000_pytorch_model.pt"
 export COSMOS_BASE="${REPO_ROOT}/Cosmos-Predict2.5-2B"
 export DATA_ROOT="${REPO_ROOT}/playground/Datasets/nvidia/PhysicalAI-Robotics-GR00T-X-Embodiment-Sim"
 export ROBOSUITE_OVERLAY="${REPO_ROOT}/environments/robosuite151-site-packages"
@@ -58,20 +61,47 @@ export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 ## Environment
 
 Use a ROCm 7.2 image containing the captured
-`torch==2.10.0a0+git449b176` build. Preserve that PyTorch installation:
+`torch==2.10.0a0+git449b176` build (the reference training runs used
+`rocm/primus:v26.2`: ROCm 7.2.0, PyTorch 2.10.0a0, Triton 3.6.0, Python 3.12.3).
+Preserve that PyTorch installation:
 
 ```bash
 python -m pip install -e . --no-deps
 python -m pip install -r environments/requirements-train-rocm.txt
 ```
 
-Fetch the gated Cosmos backbone at the pinned revision:
+### Cosmos-Predict2.5-2B
 
-```bash
-huggingface-cli download nvidia/Cosmos-Predict2.5-2B \
-  --revision 0d37c7498f54cee3c599d438d895a0a4a8608064 \
-  --local-dir "${COSMOS_BASE}"
-```
+Every DiT4DiT model in this repository loads the NVIDIA Cosmos-Predict2.5-2B
+backbone: the authors' LIBERO and RoboCasa-GR1 checkpoints (baseline and GEAK
+arms) as well as the CAE-DiT4DiT policy you train here. The model is gated on
+Hugging Face, so an anonymous download fails with a 401:
+
+1. Sign in to Hugging Face and accept the NVIDIA Open Model License on
+   [nvidia/Cosmos-Predict2.5-2B](https://huggingface.co/nvidia/Cosmos-Predict2.5-2B)
+   (access is granted automatically).
+2. Authenticate the download: `hf auth login`, or export `HF_TOKEN` with a read
+   token (`huggingface-cli login` on huggingface_hub releases before 0.34).
+3. Download it at the pinned revision (the `diffusers/base/post-trained` branch
+   the DiT4DiT authors use, as of this release):
+
+   ```bash
+   hf download nvidia/Cosmos-Predict2.5-2B \
+     --revision 0d37c7498f54cee3c599d438d895a0a4a8608064 \
+     --local-dir "${COSMOS_BASE}"
+   ```
+
+4. Point the authors' checkpoints at it. Their `config.yaml`, next to
+   `final_model/`, has the placeholder
+   `framework.cosmos25.base_model: /path/to/Cosmos-Predict2.5-2B`:
+
+   ```bash
+   sed -i "s|base_model: /path/to/Cosmos-Predict2.5-2B|base_model: ${COSMOS_BASE}|" \
+     /path/to/dit4dit-model/dit4dit_libero/config.yaml \
+     /path/to/dit4dit-model/dit4dit_robocasa_gr1/config.yaml
+   ```
+
+   A policy you train records `COSMOS_BASE` in its own run's `config.yaml`.
 
 Install the RoboCasa-GR1 source at commit `4840e67`, apply the deterministic
 reset patch, and download its separately licensed simulator assets:
@@ -80,7 +110,14 @@ reset patch, and download its separately licensed simulator assets:
 bash environments/setup_robocasa_gr1.sh
 python -m pip install -e robocasa-gr1-tabletop-tasks
 python robocasa-gr1-tabletop-tasks/robocasa/scripts/download_kitchen_assets.py
+(cd robocasa-gr1-tabletop-tasks/robocasa/scripts && python download_groot_assets.py -y)
 ```
+
+`download_groot_assets.py` fetches the GR1 tabletop object assets (`lightwheel`,
+`sketchfab`; about 270 MB from the Hugging Face dataset
+`nvidia/PhysicalAI-DigitalCousin-Assets`, no login needed, `HF_HUB_OFFLINE` must
+be unset). Without them every RoboCasa-GR1 environment fails with
+`Object registry sketchfab directory not found`.
 
 Create the evaluation overlay. Keep it separate from the training environment:
 
@@ -95,7 +132,9 @@ The overlay builder records the locally resolved hash in
 
 ## Dataset and immutable action cache
 
-Download the 24-family dataset at pinned revision `ea7ac0b`:
+Download the 24-family dataset at pinned revision `ea7ac0b`. It has about 2,000
+files and anonymous Hugging Face downloads are rate-limited, so log in (`hf auth login`)
+or export `HF_TOKEN` first:
 
 ```bash
 python examples/Robocasa_tabletop/train_files/download_gr00t_ft_data.py \
@@ -106,6 +145,20 @@ python examples/Robocasa_tabletop/train_files/audit_robocasa_full24.py \
   --data-root "${DATA_ROOT}" \
   --sample-count 3
 ```
+
+For a smoke test, `--folders` downloads single task folders (about 2,000 files
+and 2.5 GB each) instead of a `--folder-group`; the full-24 audit and action
+cache need all 24:
+
+```bash
+python examples/Robocasa_tabletop/train_files/download_gr00t_ft_data.py \
+  --folders gr1_unified.PnPBottleToCabinetClose_GR1ArmsAndWaistFourierHands_1000 \
+  --output-dir "${DATA_ROOT}"
+```
+
+Prefer the script to `hf download --include "<folder>/*"`: that lists the
+whole dataset repository before it filters, which takes a long time on this
+dataset, while the script lists only the selected folders.
 
 Build the balanced, per-family-normalized cache and frozen instruction
 features. The cache manifest binds the source inventory, split IDs, seed,
@@ -127,6 +180,27 @@ python examples/Robocasa_tabletop/train_files/precompute_action_vae_instruction_
 
 The generated cache is approximately 2.6 GiB.
 
+`--task-set` has no subset option: `full24` needs all 24 folders. To smoke-test
+the training scripts with the one folder downloaded above, give them a data root
+of 24 symlinks to that folder. The cache then has the full-24 size and layout
+but repeats one task's data, so use it only to check the pipeline, never for a
+checkpoint you evaluate:
+
+```bash
+export SMOKE_DATA_ROOT=/path/to/smoke_full24
+python -c '
+import os, runpy, sys
+FULL24_TASKS = runpy.run_path("DiT4DiT/dataloader/gr00t_lerobot/full24_tasks.py")["FULL24_TASKS"]
+src, dst = map(os.path.abspath, sys.argv[1:])
+os.makedirs(dst, exist_ok=True)
+for task in FULL24_TASKS:
+    os.symlink(src, os.path.join(dst, task.dataset_name))
+' "${DATA_ROOT}/gr1_unified.PnPBottleToCabinetClose_GR1ArmsAndWaistFourierHands_1000" "${SMOKE_DATA_ROOT}"
+```
+
+Then pass `--data-root "${SMOKE_DATA_ROOT}"` (and `DATA_ROOT_DIR`/`SOURCE_DATA_ROOT`
+in the steps below) instead of `${DATA_ROOT}`.
+
 ## Train the K8/d48 action VAE
 
 The policy uses the shared K8/d48/h256 codec with language alignment and no
@@ -141,7 +215,8 @@ export FULL24_VAE_ROOT="${REPO_ROOT}/playground/action_vae/full24_sweep"
 
 The wrapper selects `k8d48h256_none_align`, calls the native candidate
 launcher, and writes a GNU `time -v` report under
-`playground/full24_vae_sweep/`. The checkpoint lands at `ACTION_VAE`.
+`playground/full24_vae_sweep/`. The checkpoint lands at `ACTION_VAE`. It
+trains in under 15 minutes on one AMD Instinct™ MI325X GPU.
 Retraining the VAE is a reproducibility recipe, not a bitwise guarantee.
 
 ## Write the policy-global action statistics
@@ -163,7 +238,8 @@ test -f "${POLICY_STATS}"
 
 The reference run used eight AMD Instinct™ MI325X GPUs, batch 16/GPU (global
 batch 128), seed 42, frozen prompt embeddings, causal-VAE encode reuse, eager
-Cosmos execution, and no gradient checkpointing:
+Cosmos execution, and no gradient checkpointing, and took approximately five
+days:
 
 ```bash
 export SOURCE_DATA_ROOT="${DATA_ROOT}"
@@ -179,8 +255,16 @@ export SEED=42
 (cd .. && bash scripts/train_dit4dit_robocasa_latent_policy.sh)
 ```
 
-The launcher validates the dataset, backbone, visible AMD Instinct™ MI325X GPU count, and disk
-space before training. Its defaults encode the production optimization
+The launcher validates the dataset, the backbone (`COSMOS_BASE`), that exactly
+`NUM_PROCESSES` GPUs are visible, `transformers==4.57.6`, and free disk under
+`DiT4DiT/` before training: at least `MIN_FREE_GIB` GiB, 500 by default through
+this launcher (the preflight script's own default, when run directly, is 300). It copies the
+dataset to `STAGED_DATA_ROOT` under `/dev/shm`, which needs the dataset's size
+plus 64 GiB free. Other AMD Instinct™ GPUs are accepted with a warning;
+`REQUIRE_GPU_MODEL=MI325X` restores the strict reference-hardware check. For a
+smaller node, lower `NUM_PROCESSES` (listing that many GPUs in
+`HIP_VISIBLE_DEVICES`) and raise `GRADIENT_ACCUMULATION_STEPS` to keep the
+global batch of 128. Its defaults encode the production optimization
 settings and save full models every 50K steps. The top-level wrapper records
 resource usage as `training_time.txt` in the policy run directory.
 
@@ -194,7 +278,7 @@ From the parent repository, the standalone launcher runs the full protocol and
 validates the result files:
 
 ```bash
-export DIT4DIT_ROBOCASA_CKPT="${POLICY_200K}"
+export DIT4DIT_ROBOCASA_CKPT="${CAE_DIT4DIT_CKPT}"
 (cd .. && bash scripts/eval_dit4dit_robocasa.sh --arm cae)
 ```
 
@@ -235,7 +319,7 @@ The equivalent direct runner invocation for that configuration is:
 
 ```bash
 python examples/Robocasa_tabletop/eval_files/run_full24_evaluation.py \
-  --checkpoint "${POLICY_200K}" \
+  --checkpoint "${CAE_DIT4DIT_CKPT}" \
   --condition direct \
   --episodes 50 \
   --gpu-list 0,1,2,3,4,5 \

@@ -42,11 +42,12 @@ message(STATUS "instinct_sim: using ROCm at ${ROCM_PATH}")
 list(APPEND CMAKE_PREFIX_PATH "${ROCM_PATH}")
 
 # ── GPU architecture ───────────────────────────────────────────────────────
-# Build for the GPUs in this machine unless -DCMAKE_HIP_ARCHITECTURES=... is given. Left to
-# itself, CMake lists one entry per installed GPU, and on a machine (or container) where no GPU
-# is visible it silently falls back to gfx906, which runs on none of our cards. So detect here,
-# deduplicate, and fall back to MI300X/MI325X (gfx942) + MI350X/MI355X (gfx950) when nothing is
-# found. Must run before enable_language(HIP), which fixes the architecture list.
+# The simulator supports gfx950 (MI350X/MI355X) only: several kernels need more than the 64 KiB
+# of LDS that gfx942 (MI300X/MI325X) provides, so a gfx942 build fails to compile. On MI300X/MI325X
+# use --sim mujoco. Unless -DCMAKE_HIP_ARCHITECTURES=... is given, build for the gfx950 GPUs in
+# this machine; when none is visible (a GPU-less build host or container, or another GPU) fall
+# back to gfx950. Left to itself, CMake would fall back to gfx906, which runs on none of our
+# cards. Must run before enable_language(HIP), which fixes the architecture list.
 if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
     set(_hp_archs "")
     find_program(_hp_agent_enum rocm_agent_enumerator HINTS "${ROCM_PATH}/bin" NO_CACHE)
@@ -56,15 +57,17 @@ if(NOT DEFINED CMAKE_HIP_ARCHITECTURES)
         string(REPLACE "\n" ";" _hp_agents "${_hp_agents}")
         foreach(_a IN LISTS _hp_agents)
             string(STRIP "${_a}" _a)
-            if(_a MATCHES "^gfx[0-9a-f]+$" AND NOT _a STREQUAL "gfx000")
+            if(_a STREQUAL "gfx950")
                 list(APPEND _hp_archs "${_a}")
+            elseif(_a MATCHES "^gfx[0-9a-f]+$" AND NOT _a STREQUAL "gfx000")
+                message(WARNING "instinct_sim: ${_a} is not supported (gfx950 only); use --sim mujoco on this GPU")
             endif()
         endforeach()
         list(REMOVE_DUPLICATES _hp_archs)
     endif()
     if(NOT _hp_archs)
-        set(_hp_archs "gfx942;gfx950")
-        message(STATUS "instinct_sim: no GPU detected; building for ${_hp_archs}")
+        set(_hp_archs "gfx950")
+        message(STATUS "instinct_sim: no gfx950 GPU detected; building for ${_hp_archs}")
     endif()
     set(CMAKE_HIP_ARCHITECTURES "${_hp_archs}" CACHE STRING "HIP target architectures")
 endif()

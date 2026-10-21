@@ -6,6 +6,12 @@
     python3 scripts/compare_artifacts.py --arms eager,compile,geak --steps 10
     python3 scripts/compare_artifacts.py --arms eager,compile,geak,geak@2 --steps 10
 
+LATENCY ONLY. Each arm is one `geak/task/run_local.sh performance` container that
+times FastWAM.infer_action on synthetic inputs (25 warmup calls, median of 40).
+The arms' outputs are never compared: check numerics with the GEAK task's
+`run_local.sh oracle` / `correctness` gates and accuracy with the evaluation
+launchers. Prerequisites: docs/fastwam-geak-inference-optimization.md.
+
 WHY ONE SCRIPT. Latency is not portable across nodes, driver versions or even
 sessions -- two nodes on an identical stack can differ substantially.
 Numbers collected in separate runs are therefore not comparable, and a table
@@ -28,7 +34,7 @@ ARMS
                 with another N is refused), with a compile cache of its own;
                 the cell fails unless dynamo compiled graphs and the timed
                 calls did not recompile.
-  geak          the post-GEAK source tree, timed as scripts/eval_fastwam_libero.sh
+  geak          the post-GEAK source tree, timed as eval/native/run_fastwam_libero.sh
                 evaluates it: FASTWAM_KVSLAB=0 and a compile cache of its own
                 (the K/V slab lever trips an inductor lowering bug, and the
                 inductor cache key does not see the switch).
@@ -47,6 +53,9 @@ geak/task.
 
 --gpus takes the one HIP device to time on (default: EVAL_GPUS, else 0); the
 former --gpu still works with a deprecation warning.
+EVAL_DOCKER_ARGS adds `docker run` flags to every timed container, e.g.
+EVAL_DOCKER_ARGS="--cpuset-cpus 104-127" pins it to the CPUs of the GPU's NUMA node
+(the reference latency runs pinned each container that way, away from other work).
 """
 from __future__ import annotations
 
@@ -63,7 +72,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from eval_flags import deprecated, resolve_one_gpu  # noqa: E402  (scripts/eval_flags.py)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# The FastWAM baseline and GEAK trees scripts/eval_fastwam_libero.sh serves,
+# The FastWAM baseline and GEAK trees eval/native/run_fastwam_libero.sh evaluates,
 # when the source variables are unset.
 DEFAULT_SRC = {
     "BASELINE_SRC": os.path.join(REPO, "src", "fastwam-baseline"),
@@ -173,7 +182,7 @@ def measure(label: str, arm: str, steps: int, gpu: str, task_dir: str,
     p = subprocess.run(["bash", os.path.join(task_dir, "run_local.sh"), "performance"],
                        env=env, capture_output=True, text=True, timeout=7200)
     if p.returncode != 0:
-        tail = "\n".join((p.stdout + p.stderr).splitlines()[-15:])
+        tail = "\n".join((p.stdout + p.stderr).splitlines()[-60:])
         print(f"  [{label}] performance command failed (rc={p.returncode})\n{tail}",
               file=sys.stderr)
         return None

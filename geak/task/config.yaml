@@ -99,7 +99,7 @@ prompt:
     from full success to zero while its oracle stayed green. The closed-loop
     rollout is the authority.
 
-    If you cache or capture anything: the eval server reuses ONE model across
+    If you cache or capture anything: the evaluator reuses ONE model across
     episodes with a new observation each time. Invalidate per episode by COUNTER,
     never by data_ptr/_version identity -- the caching allocator hands back the
     same addresses next episode, so identity-keyed invalidation silently serves

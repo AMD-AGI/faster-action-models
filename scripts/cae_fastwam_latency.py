@@ -25,6 +25,9 @@ ARMS  (append @<steps> to override --steps for that cell, e.g. cae@4)
 
 --gpus takes the one HIP device to time on (default: EVAL_GPUS, else 0); the
 former --gpu still works with a deprecation warning.
+EVAL_DOCKER_ARGS adds `docker run` flags to every timed container, e.g.
+EVAL_DOCKER_ARGS="--cpuset-cpus 104-127" pins it to the CPUs of the GPU's NUMA node
+(the reference latency runs pinned each container that way, away from other work).
 
 ENVIRONMENT
   required  MODEL_CKPT        CAE-FastWAM checkpoint (.pt)
@@ -51,7 +54,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from eval_flags import resolve_one_gpu  # noqa: E402  (scripts/eval_flags.py)
+from eval_flags import extra_docker_args, resolve_one_gpu  # noqa: E402  (scripts/eval_flags.py)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WORKER = os.path.join(REPO, "scripts", "cae_fastwam_latency_worker.py")
@@ -94,7 +97,7 @@ def worker_argv(name: str, steps: int, a) -> list[str]:
 
 
 def docker_argv(name: str, gpu: str, env: dict) -> list[str]:
-    """Container flags, following eval/run_eval_cae_fastwam.sh."""
+    """Container flags, following eval/native/run_fastwam_libero.sh; EVAL_DOCKER_ARGS adds more."""
     uid, gid = os.getuid(), os.getgid()
     home = env.get("HOME") or f"/tmp/cae_fastwam_latency_home_{uid}"
     if not os.access(home, os.W_OK):
@@ -141,7 +144,7 @@ def docker_argv(name: str, gpu: str, env: dict) -> list[str]:
              "--env", f"TORCHINDUCTOR_CACHE_DIR={cache}/inductor",
              "--env", f"TRITON_CACHE_DIR={cache}/triton",
              # No MUJOCO_GL: the worker times the model on synthetic inputs and renders nothing.
-             "--workdir", tree, env["EVAL_IMAGE"]]
+             ] + extra_docker_args(env) + ["--workdir", tree, env["EVAL_IMAGE"]]
     return args
 
 
@@ -158,7 +161,7 @@ def measure(name: str, steps: int, a, env: dict) -> dict | None:
         if line.startswith("RESULT "):
             result = json.loads(line[len("RESULT "):])
     if p.returncode != 0 or result is None:
-        tail = "\n".join((p.stdout + p.stderr).splitlines()[-15:])
+        tail = "\n".join((p.stdout + p.stderr).splitlines()[-60:])
         print(f"  [{name}@{steps}] failed (rc={p.returncode})\n{tail}", file=sys.stderr)
         return None
     return result

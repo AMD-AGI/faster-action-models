@@ -1,48 +1,39 @@
-# Eval harness and metrics
+# Evaluation and metrics
 
-Closed-loop evaluation for an action model, built on
-[vla-evaluation-harness](https://github.com/allenai/vla-evaluation-harness).
-Read [`PROTOCOL.md`](PROTOCOL.md) first — the harness defaults are not
-necessarily your model's protocol.
+Closed-loop LIBERO evaluation for FastWAM runs FastWAM's own evaluator
+(`FastWAM/experiments/libero/eval_libero_single.py`) through
+[`native/run_fastwam_libero.sh`](native/README.md); `scripts/eval_fastwam_libero.sh`
+is a thin wrapper over it that defaults to one GPU. There is no policy server and
+no websocket hop: each GPU in `--gpus` runs one persistent worker that loads the
+model once and steps its own LIBERO environment. Read [`PROTOCOL.md`](PROTOCOL.md)
+first: it lists the protocol this evaluator applies and why common LIBERO
+evaluation defaults differ from it.
 
-This directory holds the engines. Users run them through
-`scripts/eval_fastwam_libero.sh` (`--arm baseline|geak` drives `run_eval.sh`,
-`--arm cae` drives `run_eval_cae_fastwam.sh`), which resolves the source
-tree and config root, validates the flags, and applies the GEAK arm's compile
-settings. The engines call that arm `optimized`; the launcher calls it `geak`
-and names its result directory after it.
+The launcher resolves the source tree and config root per arm (`baseline`
+`src/fastwam-baseline`, `geak` `src/fastwam-geak`, `cae` `src/cae-fastwam`),
+validates the flags, and applies each arm's compile settings. DiT4DiT runs through
+its own launchers (`scripts/eval_dit4dit_libero.sh`, `scripts/eval_dit4dit_robocasa.sh`).
 
 ## Shape
 
-A **model server** holds the policy on one GPU; **eval clients** run the
-simulator and call it over a websocket. The simulator is CPU-bound, so several
-clients can share one server.
+The simulator is CPU-bound, so the work is spread over workers, not over model
+servers. The launcher queues every (suite, task) of the selected suites (10 per
+LIBERO suite) in FastWAM's file-backed worker pool
+(`FastWAM/experiments/libero/worker_pool.py`); each worker pulls the next task,
+runs all of its trials and writes `<output-dir>/<suite>/gpu<G>_task<T>_results.json`.
 
 ```
-GPU 0 ── model server ──┬── shard 0 (tasks 0, 4, 8 ...)
-                        ├── shard 1
-                        └── shard N
+GPU 0 ── worker ── next (suite, task) from the queue, all trials, result file
+GPU 1 ── worker ── ...
 ```
 
-### Assign one *config* per GPU, not one *suite* per GPU
+`--arm cae` runs one suite at a time (the Compact Action Expert's action VAE is
+suite-conditioned and each suite has its own task config and statistics), so its
+workers drain one suite's queue before the next suite starts.
 
-The obvious layout — a suite per GPU — is badly imbalanced, because suites have
-very different horizons (LIBERO-10 is ~1.75x the others). Every config then waits
-on its slowest suite before the next can start.
-
-Giving each GPU a whole **config** (arm x step count) makes every GPU do
-identical work, so the only remaining imbalance is the intrinsic cost of the
-config itself, and all configs start together:
-
-```
-GPU 0  baseline, 10 steps
-GPU 1  geak,     10 steps
-GPU 2  geak,      2 steps
-```
-
-Pick the shard count to divide the tasks evenly. With 10 tasks per suite, 10
-shards gives exactly one task per shard per suite; 4 shards gives 3/3/2/2 and the
-config waits on its slowest shard.
+With `--sim instinct --mode batched` (`baseline` and `geak`), each GPU instead
+runs every trial of a task in lockstep on one N-world engine, one model call per
+replan; see [`native/README.md`](native/README.md).
 
 ## Metrics
 
@@ -67,32 +58,27 @@ README.
 From the repository root:
 
 ```bash
-bash scripts/eval_fastwam_libero.sh --arm baseline            # full protocol
-bash scripts/eval_fastwam_libero.sh --arm baseline --smoke    # smoke: 1 trial/task
-bash scripts/eval_fastwam_libero.sh --arm geak --steps 2      # one arm and step count
-bash scripts/eval_fastwam_libero.sh --suites libero_spatial,libero_goal
-bash scripts/eval_fastwam_libero.sh --arm geak --dry-run      # print the resolved run
+bash eval/native/run_fastwam_libero.sh --arm baseline --gpus 0              # full protocol
+bash eval/native/run_fastwam_libero.sh --arm baseline --gpus 0 --smoke      # smoke: 1 trial/task
+bash eval/native/run_fastwam_libero.sh --arm geak --steps 2 --gpus 0,1,2,3  # one worker per GPU
+bash eval/native/run_fastwam_libero.sh --suites libero_spatial,libero_goal --gpus 0
+bash eval/native/run_fastwam_libero.sh --arm geak --dry-run                 # print the resolved run
 ```
 
-One launcher run is one config (arm x step count); run one per GPU (`--gpus`)
-for the layout above. Each writes into `<output-dir>/<arm>_<N>step/` (`cae_<N>step/` for
-`--arm cae`) and records the run it holds there
-(`.run_identity`: tree, checkpoint, steps, trials, seed, shard count). A rerun
-into a directory holding results of a different run is refused rather than
+One launcher run is one config (arm x step count). It writes FastWAM's per-task
+result files and rollout videos under `<output-dir>/<suite>/` and records the run
+it holds in `<output-dir>/.run_identity` (arm, tree, checkpoint, steps, trials,
+simulator, mode). A rerun into the same directory resumes it (finished tasks are
+skipped); a directory holding results of a different run is refused rather than
 pooled with them. The launcher ends by writing `<output-dir>/summary.json`
-(pooled and per-suite successes and episodes).
+(pooled and per-suite successes and episodes) and printing one
+`eval complete: ...` line; `eval/summarize.py` and `scripts/eval_summary.py` read
+the same files.
 
 ## Always smoke-test before a full sweep
 
 A full sweep is thousands of episodes. Run `--smoke` first and check the
 result is *plausible* — a validated rig should reproduce the model's published
-success rate to within sampling noise. Two classes of bug are invisible any other
-way, because both produce confident, wrong numbers rather than errors:
-
-* a protocol or preprocessing mismatch (see `PROTOCOL.md`), and
-* a **stale model server** from an earlier run still holding the port, so the
-  clients silently evaluate the wrong arm under this run's label.
-
-`run_eval.sh` guards the second by refusing to start when its port is already
-bound. Note that killing a `docker run` client does *not* stop the container or
-free its port — remove the container.
+success rate to within sampling noise. A protocol or preprocessing mismatch (see
+`PROTOCOL.md`) is invisible any other way, because it produces confident, wrong
+numbers rather than errors.
