@@ -14,8 +14,9 @@ bash scripts/eval_fastwam_libero.sh --arm cae --full
 bash scripts/eval_fastwam_libero.sh --arm cae --steps 4 --full
 ```
 
-It needs per-suite `dataset_stats` and one server per suite;
-`eval/run_eval_cae_fastwam.sh` implements that.
+It needs per-suite `dataset_stats` (`DATASET_STATS_TEMPLATE`);
+`eval/native/run_fastwam_libero.sh --arm cae` evaluates one suite at a time
+with that suite's statistics.
 
 ## What GEAK changed
 

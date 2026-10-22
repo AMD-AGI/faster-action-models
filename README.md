@@ -62,7 +62,10 @@ before 0.34 spell the command `huggingface-cli download`.
   [FastWAM GEAK guide](docs/fastwam-geak-inference-optimization.md).
 - DiT4DiT: separate policy and simulator Python environments (LIBERO), and the
   pinned RoboCasa-GR1 stack from the [CAE-DiT4DiT guide](docs/cae-dit4dit-robocasa.md)
-  (robosuite 1.5.1 overlay, deterministic-reset patch). Every DiT4DiT run also
+  (robosuite 1.5.1 overlay, deterministic-reset patch), built inside the
+  evaluation image by `DiT4DiT/environments/setup_dit4dit_rocm_envs.sh`; the
+  DiT4DiT launchers run in that image through `scripts/in_eval_image.sh`
+  ([setup](docs/side-by-side-source-trees.md#dit4dit-python-environments-on-rocm)). Every DiT4DiT run also
   needs `nvidia/Cosmos-Predict2.5-2B`, which is gated: accept its licence on
   Hugging Face and log in before downloading it
   ([steps](docs/cae-dit4dit-robocasa.md#cosmos-predict25-2b)).
@@ -142,7 +145,13 @@ under `REPRO_DIR` (default `eval/outputs/<script name>`). `--help` prints the
 checkpoints and environment variables each script needs and the approximate
 runtime (a full FastWAM LIBERO run takes about 12-20 h on one GPU on CPU MuJoCo,
 5-10 h with `--sim instinct`, and `EVAL_GPUS=0,1,2,3` spreads it over four GPUs;
-a RoboCasa-GR1 full-24 run takes about 7 h; the runs execute one after another).
+a DiT4DiT LIBERO run uses the first of them, a RoboCasa-GR1 full-24 run one
+policy server per listed GPU and takes about 7 h; the runs execute one after
+another). Start the scripts on the host, with docker: the FastWAM launcher and
+the latency tools start `EVAL_IMAGE` containers themselves, and each DiT4DiT
+launch runs inside `EVAL_IMAGE` through
+[`scripts/in_eval_image.sh`](scripts/in_eval_image.sh), with the environments
+from [DiT4DiT Python environments on ROCm](docs/side-by-side-source-trees.md#dit4dit-python-environments-on-rocm).
 `--dry-run` prints every resolved run without assets, `--check` only checks the
 environment (every script checks it before the first run starts), `--smoke` runs
 every configuration end to end with the real checkpoints at one trial per task
@@ -163,6 +172,14 @@ python3 scripts/compare_artifacts.py --arms eager,compile,geak,geak@2 --rounds 5
 python3 scripts/cae_fastwam_latency.py --arms cae@10,cae@4 --rounds 5             # CAE-FastWAM
 python3 scripts/dit4dit_latency.py --bench libero --dry-run                       # DiT4DiT (libero|robocasa)
 ```
+
+They run on the host and start their own `EVAL_IMAGE` containers. Besides
+`EVAL_IMAGE`, `compare_artifacts.py` needs `MODEL_SRC_ROOT` (`FastWAM/`),
+`MODEL_CKPT`, `DATASET_STATS`, an existing `HF_CACHE_DIR` and `MODEL_PYTHON`
+(`/opt/venv/bin/python3`); `cae_fastwam_latency.py` needs `MODEL_CKPT` and
+`ACTION_VAE_CKPT`; `dit4dit_latency.py` needs the checkpoint
+of its `--bench`, `DIT4DIT_DIFFUSERS_SRC` and a `DIT4DIT_PYOVERLAY` with the
+pinned `transformers`/`tokenizers` (its RECIPE). Each tool's `--help` lists them.
 
 ## Training
 

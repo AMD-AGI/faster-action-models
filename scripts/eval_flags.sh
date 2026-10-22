@@ -215,7 +215,12 @@ eval_resolve_python() {
   local name="$1" value="$2"
   [[ -n "$value" ]] || { echo "set ${name} to a Python interpreter" >&2; return 2; }
   if [[ "$value" == */* ]]; then
-    [[ -x "$value" ]] || { echo "${name} must name an executable: $value" >&2; return 2; }
+    [[ -x "$value" ]] || {
+      echo "${name} must name an executable: $value" >&2
+      [[ "${FAM_IN_EVAL_IMAGE:-}" == 1 ]] || echo "(the DiT4DiT environments live in the evaluation image: run the launcher" \
+        "through scripts/in_eval_image.sh, e.g. bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_libero.sh ...)" >&2
+      return 2
+    }
     echo "$value"
   else
     command -v "$value" >/dev/null || { echo "${name} is not on PATH: $value" >&2; return 2; }

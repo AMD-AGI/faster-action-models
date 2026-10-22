@@ -104,8 +104,9 @@ def docker_argv(name: str, gpu: str, env: dict) -> list[str]:
         home = f"/tmp/cae_fastwam_latency_home_{uid}"
     os.makedirs(home, exist_ok=True)
     pw = f"/tmp/ctr_passwd_{uid}"
-    with open(pw, "w") as f:
+    with open(f"{pw}.{os.getpid()}", "w") as f:  # written atomically: other tools write the same file
         subprocess.run(["getent", "passwd", str(uid)], stdout=f, check=False)
+    os.replace(f"{pw}.{os.getpid()}", pw)
 
     def gid_of(group: str, fallback: str) -> str:
         p = subprocess.run(["getent", "group", group], capture_output=True, text=True)
@@ -168,7 +169,9 @@ def measure(name: str, steps: int, a, env: dict) -> dict | None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__.split("\n", 1)[1])
     ap.add_argument("--arms", default=DEFAULT_ARMS)
     ap.add_argument("--steps", type=int, default=10,
                     help="denoise steps for arms without an @<steps> suffix")

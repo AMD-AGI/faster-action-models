@@ -14,6 +14,10 @@
 #   --check        only check the environment, then exit
 # and checks every variable the script needs before the first run starts, so a missing one fails in
 # seconds instead of after hours of evaluation.
+#
+# Where each launch runs: the FastWAM launcher and the latency tools run on the host and start their own containers
+# of EVAL_IMAGE; the DiT4DiT launchers run inside EVAL_IMAGE (their Python environments live there), through
+# scripts/in_eval_image.sh (see `dit4dit` below). So every script runs from the host, with docker.
 
 REPRO_DRY_RUN=0
 REPRO_SMOKE=0
@@ -55,10 +59,11 @@ repro_dir() {
 }
 
 # repro_require SPEC...: each SPEC is a variable name, or alternatives "A|B" (the first set one counts).
-# Names ending in _CKPT, _STATS, _ROOT, _OVERLAY or _BUILD must name an existing path, names
-# ending in _PYTHON (but MODEL_PYTHON) an executable, and *_STATS_TEMPLATE a path for every LIBERO suite. Skipped with --dry-run.
+# Names ending in _CKPT, _STATS, _ROOT, _OVERLAY or _BUILD must name an existing path, _SRC a directory, names
+# ending in _PYTHON (but MODEL_PYTHON) an executable inside EVAL_IMAGE (checked in one container), and
+# *_STATS_TEMPLATE a path for every LIBERO suite. Skipped with --dry-run.
 repro_require() {
-  local spec name value missing=() s suite
+  local spec name value missing=() s suite image_pythons=() line
   ((REPRO_DRY_RUN)) && return 0
   for spec in "$@"; do
     value="" name=""
@@ -79,9 +84,21 @@ repro_require() {
         [[ -e "$value" ]] || missing+=("$name: no such path: $value") ;;
       MODEL_PYTHON) ;;  # the interpreter inside EVAL_IMAGE; geak/task/run_local.sh checks it in the container
       *_PYTHON)
-        command -v "$value" >/dev/null || missing+=("$name: not an executable: $value") ;;
+        # the DiT4DiT interpreters live inside EVAL_IMAGE: checked there, below
+        image_pythons+=("$name=$value") ;;
+      *_SRC)
+        [[ -d "$value" ]] || missing+=("$name: no such directory: $value") ;;
     esac
   done
+  if ((${#image_pythons[@]})) && [[ -n "${EVAL_IMAGE:-}" ]]; then
+    local out
+    # shellcheck disable=SC2016
+    if out="$(bash scripts/in_eval_image.sh sh -c 'for nv; do command -v "${nv#*=}" >/dev/null 2>&1 || echo "${nv%%=*}: not an executable in EVAL_IMAGE: ${nv#*=}"; done' _ "${image_pythons[@]}" 2>&1)"; then
+      [[ -n "$out" ]] && while IFS= read -r line; do missing+=("$line"); done <<< "$out"
+    else
+      missing+=("could not start EVAL_IMAGE ($EVAL_IMAGE) to check ${image_pythons[*]%%=*}: ${out##*$'\n'}")
+    fi
+  fi
   if ((${#missing[@]})); then
     printf 'environment check failed:\n' >&2
     printf '  %s\n' "${missing[@]}" >&2
@@ -90,6 +107,20 @@ repro_require() {
   fi
   echo "environment check passed"
   if ((REPRO_CHECK_ONLY)); then exit 0; fi
+}
+
+# dit4dit CMD...: a DiT4DiT launch (`dit4dit run bash scripts/eval_dit4dit_*.sh ...`): run it inside EVAL_IMAGE
+# through scripts/in_eval_image.sh (a dry run stays on the host: it needs no environment). The DiT4DiT LIBERO
+# launcher runs one policy server, so it gets the first GPU of EVAL_GPUS; RoboCasa takes the whole list.
+dit4dit() {
+  local fn="$1"; shift
+  local gpus="${EVAL_GPUS:-}"
+  [[ "$*" == *eval_dit4dit_libero.sh* ]] && gpus="${gpus%%,*}"
+  if ((REPRO_DRY_RUN)); then
+    EVAL_GPUS="$gpus" "$fn" "$@"
+  else
+    EVAL_GPUS="$gpus" "$fn" bash scripts/in_eval_image.sh "$@"
+  fi
 }
 
 # repro_selected CMD...: true unless --only is set and the command line does not match it.

@@ -318,5 +318,20 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("note: ignoring STEPS=2", result.stderr)
 
+class PortTests(unittest.TestCase):
+    def test_a_port_another_run_listens_on_is_refused(self):
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as busy:
+            busy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            busy.bind(("0.0.0.0", 0))
+            busy.listen()
+            port = busy.getsockname()[1]
+            with self.assertRaises(SystemExit) as cm:
+                driver.check_ports_free([port])
+            self.assertIn(f"port {port} is unavailable", str(cm.exception))
+        driver.check_ports_free([port])  # free again once nothing listens
+
+
 if __name__ == "__main__":
     unittest.main()

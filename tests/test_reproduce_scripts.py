@@ -121,6 +121,106 @@ class ReproduceScriptTests(unittest.TestCase):
                 self.assertNotIn("HARNESS", text.replace("DIT4DIT_HARNESS_ROOT", ""))
                 self.assertNotIn("vla-evaluation-harness", text)
 
+    def test_dit4dit_launches_run_in_the_image_and_libero_takes_the_first_gpu(self):
+        script = ('source scripts/reproduce_common.sh; REPRO_DRY_RUN=0; show() { echo "gpus=$EVAL_GPUS $*"; }; '
+                  'EVAL_GPUS=3,4 dit4dit show bash scripts/eval_dit4dit_libero.sh --x; '
+                  'EVAL_GPUS=3,4 dit4dit show bash scripts/eval_dit4dit_robocasa.sh --x; '
+                  'REPRO_DRY_RUN=1; EVAL_GPUS=3,4 dit4dit show bash scripts/eval_dit4dit_libero.sh --x')
+        r = subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines(), [
+            "gpus=3 bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_libero.sh --x",
+            "gpus=3,4 bash scripts/in_eval_image.sh bash scripts/eval_dit4dit_robocasa.sh --x",
+            "gpus=3 bash scripts/eval_dit4dit_libero.sh --x",  # a dry run stays on the host
+        ])
+
+    def test_every_dit4dit_launch_goes_through_the_image(self):
+        for name in SCRIPTS:
+            for line, _ in launches((ROOT / "scripts" / name).read_text()):
+                if "eval_dit4dit_" in line:
+                    with self.subTest(script=name, line=line):
+                        self.assertIn("dit4dit run bash scripts/eval_dit4dit_", line)
+
+
+class InEvalImageTests(unittest.TestCase):
+    """scripts/in_eval_image.sh, against a stand-in docker that prints its arguments."""
+
+    def run_helper(self, tmp, env_extra, *cmd):
+        bin_dir = Path(tmp) / "bin"
+        bin_dir.mkdir(exist_ok=True)
+        docker = bin_dir / "docker"
+        docker.write_text('#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a"; done\n')
+        docker.chmod(0o755)
+        env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": tmp, **env_extra}
+        return subprocess.run(["bash", str(ROOT / "scripts" / "in_eval_image.sh"), *cmd], cwd=ROOT, env=env,
+                              capture_output=True, text=True)
+
+    def test_mounts_user_and_forwarding(self):
+        with tempfile.TemporaryDirectory(dir=os.path.expanduser("~")) as tmp:
+            run_dir = Path(tmp) / "ckpt" / "dit4dit_libero"
+            (run_dir / "final_model").mkdir(parents=True)
+            (run_dir / "final_model" / "pytorch_model.pt").write_text("x")
+            cosmos = Path(tmp) / "cosmos"
+            cosmos.mkdir()
+            (run_dir / "config.yaml").write_text(f"framework:\n  cosmos25:\n    base_model: {cosmos}\n")
+            overlay = Path(tmp) / "overlay"
+            overlay.mkdir()
+            out = Path(tmp) / "out" / "run1"
+            r = self.run_helper(tmp, {
+                "EVAL_IMAGE": "img:tag",
+                "DIT4DIT_LIBERO_CKPT": str(run_dir / "final_model" / "pytorch_model.pt"),
+                "DIT4DIT_PYOVERLAY": f"{overlay}:/usr/lib",
+                "DIT4DIT_LIBERO_PYTHON": "/opt/venv/bin/python3",
+                "UNRELATED_VAR": "1",
+            }, "bash", "scripts/eval_dit4dit_libero.sh", "--output-dir", str(out))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            args = r.stdout.splitlines()
+            self.assertEqual(args[:2], ["run", "--rm"])
+            self.assertEqual(args[-4:], ["bash", "scripts/eval_dit4dit_libero.sh", "--output-dir", str(out)])
+            self.assertEqual(args[-5], "img:tag")
+            vols = [args[i + 1] for i, a in enumerate(args) if a == "-v"]
+            self.assertIn(f"{run_dir}:{run_dir}:ro", vols)
+            self.assertIn(f"{cosmos}:{cosmos}:ro", vols)
+            self.assertIn(f"{overlay}:{overlay}:rw", vols)
+            self.assertIn(f"{out}:{out}:rw", vols)
+            self.assertTrue(out.is_dir())
+            self.assertFalse(any(v.startswith("/usr/lib:") or v.startswith("/opt/") for v in vols), vols)
+            envs = [args[i + 1] for i, a in enumerate(args) if a == "-e"]
+            self.assertIn("DIT4DIT_LIBERO_PYTHON", envs)
+            self.assertIn("FAM_IN_EVAL_IMAGE=1", envs)
+            self.assertTrue(any(e.startswith("USER=") for e in envs))
+            self.assertNotIn("UNRELATED_VAR", envs)
+            self.assertIn("--ipc", args)
+            self.assertEqual(args[args.index("--user") + 1], f"{os.getuid()}:{os.getgid()}")
+            self.assertEqual(args[args.index("-w") + 1], str(ROOT))
+
+    def test_inside_the_image_runs_the_command_directly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self.run_helper(tmp, {"FAM_IN_EVAL_IMAGE": "1"}, "echo", "direct")
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, "direct"), r.stderr)
+
+    def test_needs_an_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self.run_helper(tmp, {}, "true")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("EVAL_IMAGE", r.stderr)
+
+    def test_environment_check_looks_for_the_interpreters_in_the_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = Path(tmp) / "bin"
+            bin_dir.mkdir()
+            docker = bin_dir / "docker"  # runs the in-image check on the host: /nope is missing there too
+            docker.write_text('#!/bin/bash\nwhile [[ "$1" != img ]]; do shift; done; shift; exec "$@"\n')
+            docker.chmod(0o755)
+            script = ('source scripts/reproduce_common.sh; REPRO_CHECK_ONLY=1; '
+                      'repro_require "DIT4DIT_MODEL_PYTHON|DIT4DIT_PYTHON" ROBOCASA_PYTHON')
+            env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": tmp, "EVAL_IMAGE": "img",
+                   "DIT4DIT_PYTHON": "/bin/sh", "ROBOCASA_PYTHON": "/nope/python"}
+            r = subprocess.run(["bash", "-c", script], cwd=ROOT, env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("ROBOCASA_PYTHON: not an executable in EVAL_IMAGE: /nope/python", r.stderr)
+            self.assertNotIn("DIT4DIT_PYTHON:", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

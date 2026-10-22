@@ -283,6 +283,7 @@ def server_command(args: argparse.Namespace, port: int) -> list[str]:
 def start_servers(runner, servers, args: argparse.Namespace, gpus: list[str], log_dir: Path) -> list[int]:
     """run_full24_evaluation.PolicyServers.start with the server root, script and environment as parameters."""
     ports = [args.base_port + index for index in range(len(gpus))]
+    check_ports_free(ports)
     for gpu, port in zip(gpus, ports):
         log_path = log_dir / f"server_gpu{gpu}_port{port}.log"
         log_file = log_path.open("w")
@@ -308,7 +309,27 @@ def start_servers(runner, servers, args: argparse.Namespace, gpus: list[str], lo
         runner.wait_until_ready(
             process, port, log_dir / f"server_gpu{gpu}_port{port}.log", args.server_timeout_seconds
         )
+    # The vendored server logs "server running" before it binds: a server that then failed to bind has exited.
+    time.sleep(2)
+    for process, port, gpu in zip(servers.processes, ports, gpus):
+        if process.poll() is not None:
+            raise RuntimeError(f"policy server on GPU {gpu}, port {port} exited (rc={process.returncode}); "
+                               f"see {log_dir / f'server_gpu{gpu}_port{port}.log'}")
     return ports
+
+
+def check_ports_free(ports: Sequence[int]) -> None:
+    """Refuse ports another process listens on (another run on this host): its server would answer our clients."""
+    import socket
+
+    for port in ports:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # as the server binds; TIME_WAIT is fine
+            try:
+                sock.bind(("0.0.0.0", port))
+            except OSError as exc:
+                raise SystemExit(f"policy-server port {port} is unavailable ({exc}); another run may be using it: "
+                                 f"pass --port (or PORT) with a free range of {len(ports)} ports") from None
 
 
 def run_share(segment: Segment, *, port: int, args, dit4dit_root: Path, dirs: dict, matching) -> None:
