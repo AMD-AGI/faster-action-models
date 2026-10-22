@@ -339,3 +339,6 @@ The launcher runs 10 steps by default; the evaluated configurations are
 `--arm cae --steps 10|4`. `--sim instinct` runs the same evaluation GPU-native on
 MI350X/MI355X, and `--gpus 0,1,2,3` spreads each suite's tasks over four GPUs; see
 [`side-by-side-source-trees.md`](side-by-side-source-trees.md).
+The GEMM tuning table in `src/cae-fastwam` (`FASTWAM_R2_TUNE`) was recorded on an MI355X and is
+used only there; on other GPUs, including MI350X, torch's default GEMM selection is used. The
+reference latencies are MI355X numbers.

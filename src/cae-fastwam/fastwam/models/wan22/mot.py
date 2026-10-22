@@ -845,10 +845,33 @@ _R2MOD_WARPS = int(os.environ.get("FASTWAM_R2_MOD_WARPS", "4"))
 #                             (10.9955/11.0263/11.0758 vs 11.1345/11.1361/
 #                             11.1544 ms geomean, 3/3 pairs).
 #   FASTWAM_R2_TUNE_FILE=path -> where the table is read from / written to.
+#   FASTWAM_R2_TUNE_DEVICE=name -> the table is looked up only when the GPU's
+#                             name contains this string (default "MI355X", the
+#                             device it was recorded on).  Other gfx950 parts
+#                             (e.g. MI350X) pass the validators below but lack
+#                             some of the pinned hipBLASLt solutions, and a
+#                             missing pinned solution raises instead of falling
+#                             back; they use torch's own heuristic.
 # =====================================================================
 _R2TUNE_ENABLED = os.environ.get("FASTWAM_R2_TUNE", "1") != "0"
 _R2TUNE_MODE = os.environ.get("FASTWAM_R2_TUNE_MODE", "use")
 _R2TUNE_FILE = os.environ.get("FASTWAM_R2_TUNE_FILE", "")
+_R2TUNE_DEVICE = os.environ.get("FASTWAM_R2_TUNE_DEVICE", "MI355X")
+
+
+def _fwam_r2tune_device_ok() -> bool:
+    """True when the current GPU is the one the lookup table was recorded on."""
+    try:
+        if not torch.cuda.is_available():
+            return False
+        name = torch.cuda.get_device_name(torch.cuda.current_device())
+    except Exception:  # pragma: no cover
+        return False
+    if _R2TUNE_DEVICE and _R2TUNE_DEVICE not in name:
+        logger.info("FASTWAM_R2_TUNE: table recorded on %s, GPU is %s; using torch's heuristic",
+                    _R2TUNE_DEVICE, name)
+        return False
+    return True
 
 # Recorded by `FASTWAM_R2_TUNE_MODE=tune` on MI355X / gfx950 /
 # torch 2.11.0+rocm7.14.0.  Regenerate after any torch or ROCm bump: the
@@ -888,6 +911,8 @@ def _fwam_r2tune_init() -> None:
             tun.enable(True)
             tun.tuning_enable(True)
             logger.warning("FASTWAM_R2_TUNE: RECORDING to %s", fn)
+            return
+        if not _fwam_r2tune_device_ok():
             return
         table = _R2TUNE_TABLE.strip()
         if os.environ.get("FASTWAM_R2_TUNE_X", "1") != "0":
