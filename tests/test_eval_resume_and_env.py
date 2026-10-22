@@ -260,6 +260,69 @@ class NativeMountTests(unittest.TestCase):
                 self.assertIn(v, args)
 
 
+class NativeCaeBatchedTests(unittest.TestCase):
+    """--arm cae --mode batched: one container per suite, each with that suite's task config, statistics and items."""
+
+    LAUNCHER = ROOT / "eval" / "native" / "run_fastwam_libero.sh"
+
+    def test_one_container_per_suite_with_its_own_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            box = Sandbox(Path(td))
+            log = box.root / "docker_args.txt"
+            (box.root / "bin" / "docker").write_text(
+                f'#!/usr/bin/env bash\n{{ echo "---"; printf "%s\\n" "$@"; }} >> {log}\nexit 1\n')
+            build = box.root / "simbuild"
+            (build / "python").mkdir(parents=True)
+            (build / "python" / "instinct_sim_x.so").write_text("x\n")
+            env = {**box.cae_env(), "INSTINCT_SIM_BUILD": str(build), "MUJOCO_GL": "osmesa"}
+            box.run(self.LAUNCHER, "--arm", "cae", "--mode", "batched", "--sim", "instinct", "--suites",
+                    "libero_spatial,libero_goal", "--gpus", "0", "--trials", "1", env=env, timeout=120)
+            calls = [c.strip("\n").splitlines() for c in log.read_text().split("---\n") if c.strip()]
+            workers = [c for c in calls if "eval/native/fastwam_libero_batched.py" in c]
+            names = [c[c.index("--name") + 1] for c in workers]
+            self.assertEqual(names, ["native_cae_10_batched_instinct_g0_libero_spatial",
+                                     "native_cae_10_batched_instinct_g0_libero_goal"])
+            for suite, args in zip(("libero_spatial", "libero_goal"), workers):
+                with self.subTest(suite=suite):
+                    self.assertEqual(args[args.index("--task") + 1], f"cae_{suite}")
+                    self.assertEqual(args[args.index("--dataset-stats") + 1], str(box.root / f"stats_{suite}.json"))
+                    self.assertEqual(args[args.index("--model-batch") + 1], "1")
+                    self.assertIn(f"EVALUATION.task_suite_name={suite}", args)
+                    tasks = args[args.index("--tasks") + 1].split(",")
+                    self.assertEqual(tasks, [f"{suite}:{t}" for t in range(10)])
+                    self.assertIn("HP_SOFT_FIRST_RESET=1", args)
+            identity = (box.out / ".run_identity").read_text().splitlines()
+            self.assertIn("model_batch=1", identity)
+            self.assertIn("soft_first_reset=1", identity)
+            self.assertFalse(any(line.startswith("pad_batch=") for line in identity))
+
+    def _batched_args(self, extra_env):
+        with tempfile.TemporaryDirectory() as td:
+            box = Sandbox(Path(td))
+            log = box.root / "docker_args.txt"
+            (box.root / "bin" / "docker").write_text(
+                f'#!/usr/bin/env bash\n{{ echo "---"; printf "%s\\n" "$@"; }} >> {log}\nexit 1\n')
+            build = box.root / "simbuild"
+            (build / "python").mkdir(parents=True)
+            (build / "python" / "instinct_sim_x.so").write_text("x\n")
+            env = {**box.cae_env(), "INSTINCT_SIM_BUILD": str(build), "MUJOCO_GL": "osmesa", **extra_env}
+            r = box.run(self.LAUNCHER, "--arm", "cae", "--mode", "batched", "--sim", "instinct", "--suites",
+                        "libero_spatial", "--gpus", "0", "--trials", "1", env=env, timeout=120)
+            calls = [c.strip("\n").splitlines() for c in log.read_text().split("---\n") if c.strip()] \
+                if log.exists() else []
+            return r, [c for c in calls if "eval/native/fastwam_libero_batched.py" in c]
+
+    def test_soft_first_reset_can_be_turned_off(self):
+        _, workers = self._batched_args({"HP_SOFT_FIRST_RESET": "0"})
+        self.assertEqual(len(workers), 1)
+        self.assertIn("HP_SOFT_FIRST_RESET=0", workers[0])
+
+    def test_soft_first_reset_value_is_checked(self):
+        r, workers = self._batched_args({"HP_SOFT_FIRST_RESET": "yes"})
+        self.assertEqual(workers, [])
+        self.assertIn("HP_SOFT_FIRST_RESET must be 0 or 1", r.stdout + r.stderr)
+
+
 class RobocasaResumeTests(unittest.TestCase):
     def setUp(self):
         self.driver = load(ROOT / "scripts" / "robocasa_full24.py")
