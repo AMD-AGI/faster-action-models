@@ -3,7 +3,7 @@
 One checkpoint is released: **CAE-FastWAM** on LIBERO,
 [`amd/CAE-FastWAM`](https://huggingface.co/amd/CAE-FastWAM), in the
 [Compact Action Expert (CAE) Hugging Face collection](https://huggingface.co/collections/amd/compact-action-expert-cae).
-The [write-up](https://rocm.blogs.amd.com/artificial-intelligence/faster-action-models/README.html)
+The [ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/faster-action-models/README.html)
 has the full reference results.
 
 CAE-DiT4DiT (RoboCasa-GR1) is not released as a checkpoint; train it with the

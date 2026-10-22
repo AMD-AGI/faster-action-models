@@ -15,7 +15,7 @@ Apply the three levers in this order:
 
 Latency changes across nodes, drivers, and sessions; run the comparison on the
 deployment machine. These are the reference results of the accompanying
-[write-up](https://rocm.blogs.amd.com/artificial-intelligence/faster-action-models/README.html),
+[ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/faster-action-models/README.html),
 on one AMD Instinct™ MI355X GPU (ROCm 7.14.0, PyTorch 2.11.0, `--sim instinct`),
 as success rate (latency per policy decision):
 

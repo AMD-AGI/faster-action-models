@@ -16,7 +16,7 @@ pipeline_tag: robotics
 A latent world-action policy for the [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO) benchmark, fine-tuned by Advanced Micro Devices, Inc. from [Wan2.2-TI2V-5B](https://huggingface.co/Wan-AI/Wan2.2-TI2V-5B).
 
 Code: [AMD-AGI/faster-action-models](https://github.com/AMD-AGI/faster-action-models).
-Write-up and reference results: [Optimizing World Action Models on AMD GPUs](https://rocm.blogs.amd.com/artificial-intelligence/faster-action-models/README.html).
+ROCm blog: [Optimizing World Action Models on AMD GPUs](https://rocm.blogs.amd.com/artificial-intelligence/faster-action-models/README.html).
 
 Part of the [Compact Action Expert (CAE) collection](https://huggingface.co/collections/amd/compact-action-expert-cae-6ace112e7bd665ff8c107ed2).
 
@@ -26,16 +26,16 @@ The Compact Action Expert combines a 32-dimensional action expert (about 30M par
 
 ## Results
 
-LIBERO (all four suites, 50 episodes per task) on one AMD Instinct™ MI355X GPU with ROCm 7.14.0 and PyTorch 2.11.0, simulated on the GPU (`--sim instinct`), with the GEAK-optimized inference path from the code repository. Reference results, from Table 3 of the [write-up](https://rocm.blogs.amd.com/artificial-intelligence/faster-action-models/README.html):
+LIBERO (all four suites, 50 episodes per task) on one AMD Instinct™ MI355X GPU with ROCm 7.14.0 and PyTorch 2.11.0, simulated on the GPU (`--sim instinct`), with the GEAK-optimized inference path from the code repository. Reference results, from Table 3 of the [ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/faster-action-models/README.html):
 
-| Configuration | Success (%) | Latency per policy decision (ms) |
+| Configuration | Success rate (%) | Latency per policy decision (ms) |
 |---|---|---|
 | FastWAM, no optimization (10 denoising steps) | 96.95 ± 0.22 | 222.55 |
 | FastWAM + GEAK (10 steps) | 96.86 ± 0.30 | 24.17 |
 | CAE-FastWAM + GEAK (10 steps) | 97.28 ± 0.20 | 12.82 |
 | CAE-FastWAM + GEAK (4 steps) | 97.33 ± 0.26 | 8.83 |
 
-Success is the mean ± standard deviation over 11 full LIBERO runs (5 for the 4-step row). The FastWAM rows use the authors' [`yuanty/fastwam`](https://huggingface.co/yuanty/fastwam) checkpoint. Reproduce the table with `scripts/reproduce_cae_fastwam.sh` in the code repository. Training took 22.7 hours on two AMD Instinct™ MI325X GPUs. Results are simulator measurements and may vary with configuration and software versions.
+Success rate is the mean ± standard deviation over 11 full LIBERO runs (5 for the 4-step row). The FastWAM rows use the authors' [`yuanty/fastwam`](https://huggingface.co/yuanty/fastwam) checkpoint. For reference, `torch.compile` alone cuts latency 1.6–2.6× relative to eager PyTorch on MI355X, and GEAK runs 3.7× faster than `torch.compile` for FastWAM. Reproduce the table with `scripts/reproduce_cae_fastwam.sh` in the code repository. Results are simulator measurements and may vary with configuration and software versions.
 
 ## Files
 

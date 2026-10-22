@@ -24,17 +24,17 @@ changes:
 It is trained on all four LIBERO suites and evaluated on them with 50 episodes
 per task, using the commands below. The evaluated denoise step counts are 10
 and 4. The accompanying
-[write-up](https://rocm.blogs.amd.com/artificial-intelligence/faster-action-models/README.html)
+[ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/faster-action-models/README.html)
 (Table 3) gives these reference results, on one AMD Instinct™ MI355X GPU with `--sim instinct`:
 
-| Configuration | Success (%) | Latency (ms) |
+| Configuration | Success rate (%) | Latency (ms) |
 |---|---|---|
 | FastWAM, no optimization (10 steps) | 96.95 ± 0.22 | 222.55 |
 | FastWAM + GEAK (10 steps) | 96.86 ± 0.30 | 24.17 |
 | CAE-FastWAM + GEAK (10 steps) | 97.28 ± 0.20 | 12.82 |
 | CAE-FastWAM + GEAK (4 steps) | 97.33 ± 0.26 | 8.83 |
 
-Success is the mean ± standard deviation over 11 full LIBERO runs (5 for the
+Success rate is the mean ± standard deviation over 11 full LIBERO runs (5 for the
 4-step row); latency is per policy decision. Reruns are not bit-reproducible
 and can differ by a few tenths of a point.
 
