@@ -53,7 +53,7 @@ DOCKER=(docker run --rm --init --device=/dev/kfd --device=/dev/dri --security-op
   --name "fam_in_image_${user//[^A-Za-z0-9_.-]/_}_$$")
 MOUNTED=(/tmp:rw "$ROOT:rw")
 mount_path() {  # $1=path $2=ro|rw: mount an existing absolute path at its own path, once
-  local p m
+  local p m i j
   [[ "$1" == /* && -e "$1" ]] || return 0
   p="$(realpath -ms "$1")"
   # never shadow the image's own system and environment directories
@@ -61,6 +61,20 @@ mount_path() {  # $1=path $2=ro|rw: mount an existing absolute path at its own p
     /|/usr|/usr/*|/bin|/bin/*|/sbin|/sbin/*|/lib|/lib/*|/lib64|/lib64/*|/etc|/etc/*|/proc|/proc/*|/sys|/sys/*|/dev|/dev/*) return 0 ;;
     /run|/run/*|/boot|/boot/*|/root|/root/*|/opt|/opt/venv|/opt/venv/*|/opt/LIBERO|/opt/LIBERO/*|/opt/libero_config*|/opt/rocm*) return 0 ;;
   esac
+  # The same path can arrive through a checkpoint (ro) and a cache/root variable (rw).
+  # Upgrade the existing exact mount rather than emitting a duplicate destination, which Docker rejects.
+  for i in "${!MOUNTED[@]}"; do
+    m="${MOUNTED[i]}"
+    if [[ "$p" == "${m%:*}" ]]; then
+      if [[ "$2" == rw && "${m##*:}" == ro ]]; then
+        for j in "${!DOCKER[@]}"; do
+          if [[ "${DOCKER[j]}" == "$p:$p:ro" ]]; then DOCKER[j]="$p:$p:rw"; break; fi
+        done
+        MOUNTED[i]="$p:rw"
+      fi
+      return 0
+    fi
+  done
   # covered by a mount already made: a writable one, or a read-only one when read-only is enough
   for m in "${MOUNTED[@]}"; do
     [[ ( "$p" == "${m%:*}" || "$p" == "${m%:*}"/* ) && ( "${m##*:}" == rw || "$2" == ro ) ]] && return 0

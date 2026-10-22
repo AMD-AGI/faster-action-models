@@ -19,7 +19,7 @@ OUT/<suite>/gpu<G>_task<T>_results.json in eval_libero_single's format, so its s
 
 Differences from the serial evaluator, both deliberate:
 * each slot has its own LIBERO env, so fixture placements are different draws from the same distribution than
-  one env's sequential resets: episodes are statistically, not pairwise, equivalent;
+  one env's sequential resets: scenes are not paired; equivalent Success rate requires measurement;
 * the model batch is padded to --pad-batch by repeating the first row (GEAK trees capture graphs for a fixed
   batch; 64 is the validated size). Padding rows never reach a simulator.
 Rollout videos are not written.

@@ -356,18 +356,22 @@ through the evaluator's own `_predict_action_chunk` (the GEAK kernels of
 Each model call is the serial one, so per-decision latency is unchanged; the
 wall time drops because the simulator steps all worlds at once. Each trial has
 its own LIBERO env, so its fixture placements are other draws from the same
-distribution: batched episodes are statistically, not pairwise, equivalent to
-serial ones. The success rates in the table above were measured with one policy
+distribution, not identical initial scenes. Sharing the model call path does not
+establish equivalent Success rate. The success rates in the table above were measured with one policy
 decision at a time, not with `--mode batched`.
 
 A serial and batched comparison on one MI350X, `--sim instinct`, libero_spatial,
 50 trials per task (500 episodes per cell, seed 42):
 
-| Steps | Serial SR | Serial wall | Batched SR | Batched wall |
+| Steps | Serial Success rate | Serial wall | Batched Success rate | Batched wall |
 |---|---|---|---|---|
 | 4 | 97.2% (486/500) | 46 min | 96.6% (483/500) | 26 min |
 | 10 | 97.8% (489/500) | 47 min | 97.2% (486/500) | 26 min |
 
-Both differences are within binomial noise (two-proportion test, p > 0.5). About
-half of the batched wall time is spent building the 50 LIBERO environments of
-each task on the CPU; the model calls take about a sixth.
+Batched Success rate was 0.6 percentage points lower at both step counts. The
+two-proportion tests did not detect a difference (p > 0.5); this does not prove
+equivalence. These are single spatial-suite runs, not all-suite validation or
+reproductions of the MI355X ROCm blog results. They predate the latest-main
+integration and used `FASTWAM_R2_TUNE=0` on MI350X. About half of the batched wall
+time is spent building the 50 LIBERO environments of each task on the CPU; the
+model calls take about a sixth.

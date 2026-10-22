@@ -47,7 +47,7 @@ and `model.redirect_common_files=false` (local checkpoint layout). The arm envir
     `eval_libero_single`.
 
   Each trial has its own LIBERO env, so fixture placements are other draws from the same distribution. Episodes
-  are statistically, not pairwise, equivalent to serial. The action-ensembler and future-video paths carry state
+  are not paired identical scenes; equivalent Success rate requires measurement. The action-ensembler and future-video paths carry state
   across calls and are refused.
 
   Building those N LIBERO envs on the CPU is about half of a batched task's wall time. Each env's constructor has just
@@ -62,8 +62,9 @@ and `model.redirect_common_files=false` (local checkpoint layout). The arm envir
   action-VAE suite id and statistics. Per-decision latency is that of serial; the wall time drops because the
   simulator steps all worlds in one engine. Each result file records `model_batch` and the policy's calls, seconds
   and ms per call. On one MI350X, libero_spatial with 50 trials per task (500 episodes) took 26 minutes batched
-  against 46-47 minutes serial, at 4 and at 10 steps, with success rates within binomial noise of serial
-  (see [`docs/cae-fastwam-libero.md`](../../docs/cae-fastwam-libero.md)).
+  against 46-47 minutes serial, at 4 and at 10 steps. Batched Success rate was 0.6 percentage points lower in
+  both comparisons; non-significant differences do not establish equivalence. These runs predate latest-main
+  integration (see [`docs/cae-fastwam-libero.md`](../../docs/cae-fastwam-libero.md)).
 
 ## Environment
 
