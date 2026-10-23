@@ -15,7 +15,7 @@ instinct run.
 | Model / benchmark | Evaluation code (unchanged) | Launcher |
 |---|---|---|
 | FastWAM LIBERO (baseline, GEAK, CAE-FastWAM) | `FastWAM/experiments/libero/eval_libero_single.py` (its persistent-worker mode, `worker_pool.py` queue) | `eval/native/run_fastwam_libero.sh --sim instinct --mode serial` |
-| FastWAM LIBERO baseline/GEAK, batched | the same episode loop for all trials of a task in lockstep, one model call per replan: `fastwam_libero_batched.py` | `eval/native/run_fastwam_libero.sh --sim instinct --mode batched` |
+| FastWAM LIBERO (baseline, GEAK, CAE-FastWAM), batched | the same episode loop for all trials of a task in lockstep: `fastwam_libero_batched.py`; baseline/GEAK one padded model call per replan, CAE-FastWAM one B=1 call of the evaluator's `_predict_action_chunk` per observation | `eval/native/run_fastwam_libero.sh --sim instinct --mode batched` |
 | DiT4DiT LIBERO | `examples/LIBERO/eval_files/eval_libero.py` of the arm's tree + its policy server | `scripts/eval_dit4dit_libero.sh --sim instinct` |
 | DiT4DiT RoboCasa-GR1 full-24 (CAE-DiT4DiT and the baseline/GEAK trees) | `DiT4DiT/examples/Robocasa_tabletop/eval_files/` full-24 harness and `simulation_env.py` clients (driven by `scripts/robocasa_full24.py`), with the arm's policy server | `scripts/eval_dit4dit_robocasa.sh --sim instinct --clients-per-gpu 6` with `--arm baseline\|geak\|cae` |
 
@@ -47,8 +47,24 @@ and `model.redirect_common_files=false` (local checkpoint layout). The arm envir
     `eval_libero_single`.
 
   Each trial has its own LIBERO env, so fixture placements are other draws from the same distribution. Episodes
-  are statistically, not pairwise, equivalent to serial. Baseline and GEAK only: CAE-FastWAM (`--arm cae`) and the
-  action-ensembler paths change per-observation control flow and are refused.
+  are not paired identical scenes; equivalent Success rate requires measurement. The action-ensembler and future-video paths carry state
+  across calls and are refused.
+
+  Building those N LIBERO envs on the CPU is about half of a batched task's wall time. Each env's constructor has just
+  reset it, so batched mode sets `HP_SOFT_FIRST_RESET=1` by default: a world's first reset skips the hard reset,
+  which would only rebuild and recompile the same model (speed only, see `simulate/PROVENANCE.md`;
+  `HP_SOFT_FIRST_RESET=0` restores it). The value is recorded in `.run_identity`.
+- **Batched CAE-FastWAM** (`--arm cae --mode batched`, `--sim instinct` only) steps the N worlds the same way but
+  calls the model once per observation at batch 1 (`--model-batch 1`): the evaluator's own `_predict_action_chunk`,
+  so each call is the serial one (compiled action inference, latent noise, action-VAE decode, per-suite
+  denormalization, gripper handling). Its GEAK kernels and compiled graphs are single-batch, so `--pad-batch` is
+  ignored. As in serial, it runs one suite at a time (one container per suite and GPU) with that suite's task config,
+  action-VAE suite id and statistics. Per-decision latency is that of serial; the wall time drops because the
+  simulator steps all worlds in one engine. Each result file records `model_batch` and the policy's calls, seconds
+  and ms per call. On one MI350X, libero_spatial with 50 trials per task (500 episodes) took 26 minutes batched
+  against 46-47 minutes serial, at 4 and at 10 steps. Batched Success rate was 0.6 percentage points lower in
+  both comparisons; non-significant differences do not establish equivalence. These runs predate latest-main
+  integration (see [`docs/cae-fastwam-libero.md`](../../docs/cae-fastwam-libero.md)).
 
 ## Environment
 
@@ -121,6 +137,12 @@ export INSTINCT_SIM_BUILD=$PWD/build/instinct-sim-libero     # bash simulate/bui
 export MODEL_CKPT=$PWD/checkpoints/fastwam/libero_uncond_2cam224.pt          # MODEL_ZOO.md, baseline checkpoints
 export DATASET_STATS=$PWD/checkpoints/fastwam/libero_uncond_2cam224_dataset_stats.json
 bash eval/native/run_fastwam_libero.sh --sim instinct --arm geak --steps 10 --mode batched --gpus 1,2,3,4
+
+# CAE-FastWAM, batched (one suite per process; MODEL_ZOO.md, CAE-FastWAM)
+export MODEL_CKPT=$PWD/checkpoints/CAE-FastWAM/policy.pt ACTION_VAE_CKPT=$PWD/checkpoints/CAE-FastWAM/action_vae.pt
+export TASK_CONFIG=libero_uncond_2cam224_1e-4_32hdim_latent_K8d16_freebits_pernorm_joint
+export DATASET_STATS_TEMPLATE=$PWD/checkpoints/CAE-FastWAM/stats/{suite}.json
+bash eval/native/run_fastwam_libero.sh --sim instinct --arm cae --steps 4 --mode batched --gpus 1,2,3,4
 ```
 
 Results go to `<output>/<suite>/gpu<G>_task<T>_results.json` in FastWAM's format. FastWAM's

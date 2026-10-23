@@ -153,6 +153,19 @@ class ArmTests(unittest.TestCase):
         self.assertEqual(dry("native", "--arm", "cae", "--steps", "4")["steps"], "4")
         self.assertEqual(dry("dit4dit-robocasa", "--arm", "cae")["steps"], "checkpoint-steps")
 
+    def test_cae_batched_calls_the_model_once_per_observation(self):
+        plan = dry("native", "--arm", "cae", "--sim", "instinct", "--mode", "batched", "--steps", "4")
+        self.assertEqual(plan["mode"], "batched")
+        self.assertEqual(plan["model_batch"], "1 (per observation)")
+        self.assertNotIn("pad_batch", plan)
+        self.assertEqual(plan["configs"], str(ROOT / "FastWAM" / "configs"))
+        self.assertEqual(plan["steps"], "4")
+        self.assertEqual(plan["soft_first_reset"], "1")
+        geak = dry("native", "--sim", "instinct", "--mode", "batched", "--arm", "geak")
+        self.assertEqual(geak["pad_batch"], "64")
+        self.assertEqual(geak["soft_first_reset"], "1")
+        self.assertNotIn("soft_first_reset", dry("native", "--sim", "instinct", "--arm", "cae"))
+
     def test_arm_refusals(self):
         cases = (
             ("fastwam", ("--nope", "x"), "unknown argument: --nope"),
@@ -166,8 +179,7 @@ class ArmTests(unittest.TestCase):
             ("dit4dit-libero", ("--arm", "cae"),
              "--arm cae is the RoboCasa Compact Action Expert policy; DiT4DiT LIBERO has baseline and geak"),
             ("dit4dit-robocasa", ("--arm", "cae", "--steps", "4"), "--steps is not available with --arm cae"),
-            ("native", ("--arm", "cae", "--sim", "instinct", "--mode", "batched"),
-             "--mode batched supports --arm baseline and geak only"),
+            ("native", ("--arm", "cae", "--mode", "batched"), "--mode batched runs N worlds on one GPU engine; it needs --sim instinct"),
         )
         for name, args, expected in cases:
             with self.subTest(launcher=name, args=args):

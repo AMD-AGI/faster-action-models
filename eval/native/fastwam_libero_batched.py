@@ -19,10 +19,22 @@ OUT/<suite>/gpu<G>_task<T>_results.json in eval_libero_single's format, so its s
 
 Differences from the serial evaluator, both deliberate:
 * each slot has its own LIBERO env, so fixture placements are different draws from the same distribution than
-  one env's sequential resets: episodes are statistically, not pairwise, equivalent;
+  one env's sequential resets: scenes are not paired; equivalent Success rate requires measurement;
 * the model batch is padded to --pad-batch by repeating the first row (GEAK trees capture graphs for a fixed
   batch; 64 is the validated size). Padding rows never reach a simulator.
 Rollout videos are not written.
+
+CAE-FastWAM (src/cae-fastwam, an action-VAE model) runs with --model-batch 1: the N worlds still step in lockstep,
+but each observation that needs a new chunk gets its own B=1 call of the serial evaluator's
+_predict_action_chunk (its GEAK kernels and compiled graphs are single-batch). Each model call is therefore the
+serial one -- compile_action_infer, the latent noise, the action-VAE decode, denormalization, gripper handling
+-- and only the fixture draws differ, as above. The action-VAE model is per suite: the suite id is set from
+EVALUATION.task_suite_name before the checkpoint loads, as the serial evaluator does, and every --tasks item must
+belong to that suite (the launcher runs one suite per process).
+
+    python3 eval/native/fastwam_libero_batched.py --config-dir FastWAM/configs \
+        --task <TASK_CONFIG>_libero_spatial --ckpt CKPT --dataset-stats STATS_SPATIAL --steps 4 --model-batch 1 \
+        --override EVALUATION.task_suite_name=libero_spatial --tasks libero_spatial:0,libero_spatial:1 --output-dir OUT
 """
 from __future__ import annotations
 
@@ -66,28 +78,74 @@ def compose_cfg(a):
     return cfg
 
 
-def refuse_unbatched_features(cfg, model):
-    """Configurations whose per-observation control flow this driver does not batch."""
+def refuse_unbatched_features(cfg, model, per_obs=False):
+    """Configurations whose per-observation control flow this driver does not implement.
+
+    per_obs (--model-batch 1): every call is the serial evaluator's own _predict_action_chunk, which handles
+    compile_action_infer, text CFG, action_infer_mode and the action VAE itself; only the features that carry
+    state across calls (future-video visualisation, the action ensembler) stay refused."""
     ev = cfg.EVALUATION
     bad = []
     if bool(ev.get("visualize_future_video", False)):
         bad.append("visualize_future_video")
     if bool(ev.get("use_action_ensembler", False)):
         bad.append("use_action_ensembler")
-    if bool(ev.get("compile_action_infer", False)):
-        bad.append("compile_action_infer")
-    if float(ev.get("text_cfg_scale", 1.0)) != 1.0:
-        bad.append("text_cfg_scale != 1")
-    if getattr(model, "action_vae", None) is not None:
-        bad.append("Compact Action Expert (action VAE)")
-    if "action_infer_mode" in inspect.signature(model.infer_action).parameters and \
-            str(ev.get("action_infer_mode", "idm")) != "idm":
-        bad.append("action_infer_mode != idm")
+    if not per_obs:
+        if bool(ev.get("compile_action_infer", False)):
+            bad.append("compile_action_infer")
+        if float(ev.get("text_cfg_scale", 1.0)) != 1.0:
+            bad.append("text_cfg_scale != 1")
+        if getattr(model, "action_vae", None) is not None:
+            bad.append("Compact Action Expert (action VAE) at a padded batch (use --model-batch 1)")
+        if "action_infer_mode" in inspect.signature(model.infer_action).parameters and \
+                str(ev.get("action_infer_mode", "idm")) != "idm":
+            bad.append("action_infer_mode != idm")
     if bad:
         raise SystemExit(f"batched driver does not implement: {', '.join(bad)}; use the serial native eval")
 
 
-def load_model(cfg):
+def parse_tasks(csv):
+    """--tasks CSV of suite:task_id -> [(suite, task_id)]."""
+    items = []
+    for item in csv.split(","):
+        suite, tid = item.split(":")
+        if suite not in SUITE_IDS:
+            raise SystemExit(f"unknown suite {suite}")
+        items.append((suite, int(tid)))
+    return items
+
+
+def set_action_vae_suite(model, cfg):
+    """The serial evaluator's suite id (eval_libero_single.eval_single_process): an action-VAE model conditioned on
+    the suite gets SUITE_IDS[EVALUATION.task_suite_name], before the checkpoint loads. A task config that names
+    another suite id is refused rather than silently overridden."""
+    vae = getattr(model, "action_vae", None)
+    if vae is None or int(vae.cfg.num_suites) <= 0:
+        return None
+    suite = str(cfg.EVALUATION.task_suite_name)
+    if suite not in SUITE_IDS:
+        raise SystemExit(f"no action-VAE suite id for EVALUATION.task_suite_name={suite}")
+    sid = SUITE_IDS[suite]
+    configured = cfg.model.get("action_vae_suite_id", None)
+    if configured is not None and int(configured) != sid:
+        raise SystemExit(f"task config sets model.action_vae_suite_id={configured}, but "
+                         f"EVALUATION.task_suite_name={suite} is suite id {sid}; use that suite's task config")
+    model.action_vae_suite_id = sid
+    return sid
+
+
+def check_task_suites(items, cfg, model):
+    """An action-VAE model and its statistics are per suite: every task must be from EVALUATION.task_suite_name."""
+    if getattr(model, "action_vae", None) is None:
+        return
+    suite = str(cfg.EVALUATION.task_suite_name)
+    other = sorted({s for s, _ in items if s != suite})
+    if other:
+        raise SystemExit(f"the action-VAE model is loaded for {suite} (EVALUATION.task_suite_name); --tasks has "
+                         f"{', '.join(other)}: run one suite per process")
+
+
+def load_model(cfg, items=()):
     """eval_libero_single.eval_single_process's model/processor setup, verbatim in effect."""
     from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor  # noqa: F401
     from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
@@ -96,6 +154,8 @@ def load_model(cfg):
     device = EL._resolve_eval_device(cfg)
     dtype = EL._mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
     model = instantiate(cfg.model, model_dtype=dtype, device=device)
+    check_task_suites(items, cfg, model)
+    set_action_vae_suite(model, cfg)
     EL._load_model_checkpoint(model, str(cfg.ckpt))
     model = model.to(device).eval()
     stats = load_dataset_stats_from_json(str(EL._resolve_dataset_stats_path(cfg)))
@@ -154,6 +214,28 @@ class BatchedPolicy:
         return chunks
 
 
+class PerObservationPolicy:
+    """One B=1 call of the serial evaluator's _predict_action_chunk per observation (--model-batch 1)."""
+
+    def __init__(self, cfg, model, processor, device, action_horizon, input_w, input_h):
+        self.cfg, self.model, self.processor, self.device = cfg, model, processor, device
+        self.action_horizon, self.input_w, self.input_h = action_horizon, input_w, input_h
+        self.calls, self.seconds = 0, 0.0
+
+    def __call__(self, obs_list, task_description):
+        """Action chunks [T, 7] for each observation, exactly as the serial evaluator computes them."""
+        t0 = time.perf_counter()
+        chunks = [EL._predict_action_chunk(o, task_description, self.model, self.processor, self.cfg,
+                                           action_horizon=self.action_horizon, input_w=self.input_w,
+                                           input_h=self.input_h, model_device=self.device)[0]
+                  for o in obs_list]
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        self.seconds += time.perf_counter() - t0
+        self.calls += len(obs_list)
+        return chunks
+
+
 def run_task(suite, task_id, cfg, policy, num_envs, gpu_label, out_root):
     from libero.libero import benchmark, get_libero_path
     from instinct_sim_libero import HipLiberoVectorEnv
@@ -173,7 +255,9 @@ def run_task(suite, task_id, cfg, policy, num_envs, gpu_label, out_root):
     results = {"task_suite": suite, "task_id": task_id, "task_description": task.language, "successes": 0,
                "total_episodes": trials, "gpu_id": gpu_label, "success_episodes": [], "failure_episodes": [],
                "start_time": time.strftime("%Y-%m-%d %H:%M:%S"), "duration": 0,
-               "mode": "instinct-batched", "num_envs": n}
+               "mode": "instinct-batched", "num_envs": n,
+               "model_batch": 1 if isinstance(policy, PerObservationPolicy) else policy.pad_batch}
+    calls0, seconds0 = policy.calls, policy.seconds
     venv = HipLiberoVectorEnv(env_args, num_envs=n, seed=cfg.get("seed"))
     try:
         for first in range(0, trials, n):
@@ -208,6 +292,9 @@ def run_task(suite, task_id, cfg, policy, num_envs, gpu_label, out_root):
     finally:
         venv.close()
     results["duration"] = time.time() - start
+    calls = policy.calls - calls0
+    results["policy"] = {"calls": calls, "seconds": policy.seconds - seconds0,
+                         "ms_per_call": 1e3 * (policy.seconds - seconds0) / calls if calls else None}
     out_dir = out_root / suite
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"gpu{gpu_label}_task{task_id}_results.json"
@@ -229,27 +316,34 @@ def main():
     ap.add_argument("--trials", type=int, default=50)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--num-envs", type=int, default=50, help="worlds (episodes in lockstep) per task")
-    ap.add_argument("--pad-batch", type=int, default=64, help="model batch size (rows padded)")
+    ap.add_argument("--pad-batch", type=int, default=64, help="model batch size (rows padded); ignored with --model-batch 1")
+    ap.add_argument("--model-batch", choices=("auto", "1"), default="auto",
+                    help="auto: one padded call per replan (baseline, geak); 1: one B=1 call per observation (cae)")
     ap.add_argument("--gpu-label", default=os.environ.get("HP_GPU_LABEL", "0"))
     ap.add_argument("--override", action="append", default=[], help="extra hydra override (repeatable)")
     a = ap.parse_args()
 
     print(f"[batched] fastwam from {os.path.dirname(fastwam.__file__)}", flush=True)
+    items = parse_tasks(a.tasks)
+    per_obs = a.model_batch == "1"
     cfg = compose_cfg(a)
-    model, processor, device, action_horizon, w, h = load_model(cfg)
-    refuse_unbatched_features(cfg, model)
-    policy = BatchedPolicy(cfg, model, processor, device, action_horizon, w, h, a.pad_batch)
+    model, processor, device, action_horizon, w, h = load_model(cfg, items)
+    refuse_unbatched_features(cfg, model, per_obs)
+    if per_obs:
+        sid = getattr(model, "action_vae_suite_id", None)
+        print(f"[batched] model batch 1 (one call per observation); action-VAE suite id {sid}", flush=True)
+        policy = PerObservationPolicy(cfg, model, processor, device, action_horizon, w, h)
+    else:
+        policy = BatchedPolicy(cfg, model, processor, device, action_horizon, w, h, a.pad_batch)
     out_root = Path(a.output_dir).resolve()
-    for item in a.tasks.split(","):
-        suite, tid = item.split(":")
-        if suite not in SUITE_IDS:
-            raise SystemExit(f"unknown suite {suite}")
+    for suite, tid in items:
         if (out_root / suite / f"gpu{a.gpu_label}_task{tid}_results.json").exists():
             print(f"[batched] {suite} t{tid}: result exists, skipped", flush=True)
             continue
         r = run_task(suite, int(tid), cfg, policy, a.num_envs, a.gpu_label, out_root)
-        print(f"[batched] {suite} t{tid}: {r['successes']}/{r['total_episodes']} in {r['duration']:.0f} s",
-              flush=True)
+        pm = r["policy"]["ms_per_call"]
+        print(f"[batched] {suite} t{tid}: {r['successes']}/{r['total_episodes']} in {r['duration']:.0f} s"
+              f"{'' if pm is None else f' (policy {pm:.1f} ms/call)'}", flush=True)
 
 
 if __name__ == "__main__":

@@ -22,8 +22,9 @@ Options:
   --mode NAME     serial (default): FastWAM's evaluator (FastWAM/experiments/libero/eval_libero_single.py,
                     persistent worker per GPU), unchanged.
                   batched: eval/native/fastwam_libero_batched.py -- the same episode loop for all trials of a
-                    task in lockstep on one N-world engine, one model call per replan. Needs --sim instinct;
-                    --arm baseline and geak only.
+                    task in lockstep on one N-world engine. Needs --sim instinct. baseline, geak: one padded
+                    model call per replan. cae: one B=1 model call per observation (FastWAM's own
+                    _predict_action_chunk; its GEAK kernels are single-batch), one suite at a time.
   --arm NAME      baseline (default), geak or cae (CAE-FastWAM: Compact Action Expert, the 32-hidden-dimension
                     Action DiT with the K8 x d16 action VAE, GEAK-optimized; one suite at a time).
   --steps N       Denoise steps (default 10). Advertised: baseline 10, geak 10 and 2, cae 10 and 4. Baseline at
@@ -35,7 +36,8 @@ Options:
   --output-dir DIR  Run directory (default: EVAL_OUTPUT_ROOT, else
                     eval/outputs/fastwam-libero-<arm>-<N>step-<sim>-<mode>-<UTC>). A rerun into it skips
                     finished tasks, and is refused when it holds results of a different cell.
-  --num-envs N    batched: worlds per task (default 50).   --pad-batch N  batched: model batch (default 64).
+  --num-envs N    batched: worlds per task (default 50).   --pad-batch N  batched: model batch (default 64;
+                    ignored with --arm cae, which calls the model once per observation).
   --record-video  Accepted for a common command line. Serial: a no-op, FastWAM's evaluator always writes one video
                     per episode under <output-dir>/<suite>/videos/. Batched writes no videos and refuses it.
   --dry-run       Print the resolved arm, tree, configs, steps, trials, suites, GPUs, mode, simulator and
@@ -56,7 +58,8 @@ Required environment:
 Optional: STEPS, TRIALS (defaults for --steps, --trials), EVAL_GPUS (default for --gpus), EVAL_OUTPUT_ROOT (default
   for --output-dir), EVAL_PYOVERLAY (extra PYTHONPATH entries, e.g. FastWAM eval deps the image lacks),
   LIBERO_CONFIG_PATH, HF_HOME, DIFFSYNTH_MODEL_BASE_PATH, DIFFSYNTH_DOWNLOAD_SOURCE, DIFFSYNTH_SKIP_DOWNLOAD,
-  TOKENIZERS_PARALLELISM (forwarded when set), EVAL_DOCKER_ARGS (extra `docker run` flags for every worker, e.g.
+  TOKENIZERS_PARALLELISM (forwarded when set), HP_SOFT_FIRST_RESET (batched: 1 by default, 0 restores LIBERO's
+  hard reset on each world's first reset; see simulate/PROVENANCE.md), EVAL_DOCKER_ARGS (extra `docker run` flags for every worker, e.g.
   "--cpuset-cpus 0-31"; not --name). The container sees the repository, /mnt and /tmp, plus every path
   above (LIBERO_ROOT, LIBERO_CONFIG_PATH, INSTINCT_SIM_BUILD, the checkpoint and statistics directories,
   DIFFSYNTH_MODEL_BASE_PATH, HF_HOME, EVAL_PYOVERLAY entries, the output directory), each mounted at its own path.
@@ -65,7 +68,7 @@ EOF
 }
 
 SIM=mujoco MODE=serial ARM=baseline STEPS="${STEPS:-}" TRIALS="${TRIALS:-50}" NUM_ENVS=50 PAD_BATCH=64
-ALLOW_BASELINE_STEPS=0 RECORD_VIDEO=0 DRY_RUN=0
+ALLOW_BASELINE_STEPS=0 RECORD_VIDEO=0 DRY_RUN=0 SOFT_FIRST_RESET="${HP_SOFT_FIRST_RESET:-1}"
 SUITES_CSV=libero_spatial,libero_object,libero_goal,libero_10 GPUS_CSV="${EVAL_GPUS:-0,1,2,3}"
 OUTPUT_DIR="${EVAL_OUTPUT_ROOT:-}"
 while [ $# -gt 0 ]; do
@@ -107,11 +110,11 @@ eval_check_fastwam_steps "$ARM" "$STEPS" "$ALLOW_BASELINE_STEPS"
 eval_check_posint --trials "$TRIALS"
 eval_check_posint --num-envs "$NUM_ENVS"
 eval_check_posint --pad-batch "$PAD_BATCH"
+[[ "$SOFT_FIRST_RESET" == 0 || "$SOFT_FIRST_RESET" == 1 ]] || eval_fail "HP_SOFT_FIRST_RESET must be 0 or 1, got $SOFT_FIRST_RESET"
 eval_check_gpus "$GPUS_CSV" 0
 eval_check_suites "$SUITES_CSV"
 [[ "$MODE" == batched && "$SIM" != instinct ]] && \
   eval_fail "--mode batched runs N worlds on one GPU engine; it needs --sim instinct"
-[[ "$MODE" == batched && "$ARM" == cae ]] && eval_fail "--mode batched supports --arm baseline and geak only"
 [[ "$MODE" == batched && "$RECORD_VIDEO" == 1 ]] && \
   eval_unsupported --record-video "--mode batched writes no rollout videos; use --mode serial, which always writes them"
 if [[ "$ARM" != cae ]]; then
@@ -127,7 +130,9 @@ if ((DRY_RUN)); then
   # --sim instinct renders cameras on the GPU simulator; its helper MuJoCo contexts stay on OSMesa.
   if [[ "$SIM" == instinct ]]; then dry+=("mujoco_gl=osmesa (--sim instinct helper contexts)")
   else dry+=("mujoco_gl=$(eval_mujoco_gl_dry_run)"); fi
-  [[ "$MODE" == batched ]] && dry+=("num_envs=$NUM_ENVS" "pad_batch=$PAD_BATCH")
+  if [[ "$MODE" == batched && "$ARM" == cae ]]; then dry+=("num_envs=$NUM_ENVS" "model_batch=1 (per observation)")
+  elif [[ "$MODE" == batched ]]; then dry+=("num_envs=$NUM_ENVS" "pad_batch=$PAD_BATCH"); fi
+  [[ "$MODE" == batched ]] && dry+=("soft_first_reset=$SOFT_FIRST_RESET")
   eval_dry_run "${dry[@]}" "record_video=$([[ "$MODE" == serial ]] && echo "1 (always)" || echo 0)" \
     "output=$(realpath -m "$OUT")"
 fi
@@ -180,7 +185,9 @@ else
 fi
 [[ "$SIM" == instinct ]] && identity+=("instinct_sim_build=$(realpath -m "$INSTINCT_SIM_BUILD")")
 # batched result files are per GPU label, so another GPU list would replay finished tasks
-[[ "$MODE" == batched ]] && identity+=("num_envs=$NUM_ENVS" "pad_batch=$PAD_BATCH" "gpus=$GPUS_CSV")
+if [[ "$MODE" == batched && "$ARM" == cae ]]; then identity+=("num_envs=$NUM_ENVS" "model_batch=1" "gpus=$GPUS_CSV")
+elif [[ "$MODE" == batched ]]; then identity+=("num_envs=$NUM_ENVS" "pad_batch=$PAD_BATCH" "gpus=$GPUS_CSV"); fi
+[[ "$MODE" == batched ]] && identity+=("soft_first_reset=$SOFT_FIRST_RESET")
 has_results=0
 compgen -G "$OUT/*/gpu*_task*_results.json" >/dev/null && has_results=1
 eval_claim_run_dir "$OUT/.run_identity" "$(printf '%s\n' "${identity[@]}")" "$has_results" || exit 2
@@ -258,11 +265,19 @@ worker() {  # $1=gpu $2=suite-or-"" (cae runs one suite at a time) $3..=items (b
   if [[ "$MODE" == batched ]]; then
     local specs=() it; for it in "$@"; do specs+=("${it/,/:}"); done
     local csv; csv="$(IFS=,; echo "${specs[*]}")"
-    "${run[@]}" -e "PYTHONPATH=$PP" -e "HP_GPU_LABEL=$G" -w "$ROOT" "$EVAL_IMAGE" \
-      /opt/venv/bin/python3 eval/native/fastwam_libero_batched.py --config-dir "$CONFIGS" --task "$TASK" \
-      --ckpt "$MODEL_CKPT" --dataset-stats "$DATASET_STATS" --steps "$STEPS" --tasks "$csv" --output-dir "$OUT" \
+    # cae: the per-suite task config, statistics and action-VAE suite, and one B=1 model call per observation
+    local btask="${TASK:-}" bstats="${DATASET_STATS:-}" bextra=()
+    if [[ "$ARM" == cae ]]; then
+      btask="${TASK_CONFIG}_$S"; bstats="${DATASET_STATS_TEMPLATE//\{suite\}/$S}"
+      bextra=(--model-batch 1 --override "EVALUATION.task_suite_name=$S")
+    fi
+    # Every slot is a freshly built LIBERO env whose constructor has just reset it, so the first hard reset would
+    # only rebuild the same model again; HP_SOFT_FIRST_RESET=1 skips that rebuild (speed only; simulate/PROVENANCE.md).
+    "${run[@]}" -e "PYTHONPATH=$PP" -e "HP_GPU_LABEL=$G" -e "HP_SOFT_FIRST_RESET=$SOFT_FIRST_RESET" -w "$ROOT" "$EVAL_IMAGE" \
+      /opt/venv/bin/python3 eval/native/fastwam_libero_batched.py --config-dir "$CONFIGS" --task "$btask" \
+      --ckpt "$MODEL_CKPT" --dataset-stats "$bstats" --steps "$STEPS" --tasks "$csv" --output-dir "$OUT" \
       --trials "$TRIALS" --num-envs "$NUM_ENVS" --pad-batch "$PAD_BATCH" \
-      --override model.redirect_common_files=false
+      --override model.redirect_common_files=false "${bextra[@]+"${bextra[@]}"}"
     return
   fi
   local task="${TASK:-}" stats="${DATASET_STATS:-}" extra=() pool="$OUT/.pool"
@@ -331,7 +346,7 @@ run_pool() {  # $1=suite-or-"" $2..=items
 }
 
 rc=0
-if [[ "$ARM" == cae && "$MODE" == serial ]]; then
+if [[ "$ARM" == cae ]]; then
   for S in "${SUITES[@]}"; do        # per-suite model: task config, action-VAE suite id and stats differ
     sitems=(); for it in "${ITEMS[@]}"; do [[ "${it%%,*}" == "$S" ]] && sitems+=("$it"); done
     run_pool "$S" "${sitems[@]}" || rc=1

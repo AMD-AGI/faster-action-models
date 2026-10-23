@@ -80,6 +80,14 @@ repro_require() {
         for suite in libero_spatial libero_object libero_goal libero_10; do
           [[ -f "${value//\{suite\}/$suite}" ]] || missing+=("$name: no file ${value//\{suite\}/$suite}")
         done ;;
+      DIT4DIT_PYOVERLAY)
+        # PYTHONPATH-style list, including the documented pyoverlay:d4pins latency setup.
+        local overlay_parts=() part
+        IFS=: read -r -a overlay_parts <<< "$value"
+        for part in "${overlay_parts[@]}"; do
+          [[ -n "$part" && -d "$part" ]] || missing+=("$name: no such directory: $part")
+        done
+        [[ "$value" != *: ]] || missing+=("$name: empty trailing path component") ;;
       *_CKPT|*_STATS|*_ROOT|*_OVERLAY|*_BUILD)
         [[ -e "$value" ]] || missing+=("$name: no such path: $value") ;;
       MODEL_PYTHON) ;;  # the interpreter inside EVAL_IMAGE; geak/task/run_local.sh checks it in the container

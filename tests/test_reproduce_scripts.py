@@ -107,6 +107,20 @@ class ReproduceScriptTests(unittest.TestCase):
             self.assertEqual(r.stdout.count("skipped (--only"), 3)  # baseline, geak and the FastWAM latency
             self.assertIn("dry run, not timing: python3 scripts/cae_fastwam_latency.py", r.stdout)
 
+    def test_environment_check_accepts_overlay_path_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            a, b = Path(tmp) / "pyoverlay", Path(tmp) / "d4pins"
+            a.mkdir(); b.mkdir()
+            script = 'source scripts/reproduce_common.sh; REPRO_CHECK_ONLY=1; repro_require DIT4DIT_PYOVERLAY'
+            for value, expected in [(str(a), 0), (f"{a}:{b}", 0),
+                                    (f"{a}:{tmp}/missing", 2), (f"{a}:", 2),
+                                    (f":{a}", 2), (f"{a}::{b}", 2)]:
+                with self.subTest(value=value):
+                    env = {"PATH": "/usr/bin:/bin", "HOME": tmp, "DIT4DIT_PYOVERLAY": value}
+                    result = subprocess.run(["bash", "-c", script], cwd=ROOT, env=env,
+                                            capture_output=True, text=True)
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+
     def test_latency_tools_time_on_the_first_gpu(self):
         script = ('source scripts/reproduce_common.sh; REPRO_DRY_RUN=0; '
                   'EVAL_GPUS=3,4,6 latency bash -c \'echo "gpus=$EVAL_GPUS $*"\' _ --x')
@@ -193,6 +207,23 @@ class InEvalImageTests(unittest.TestCase):
             self.assertIn("--ipc", args)
             self.assertEqual(args[args.index("--user") + 1], f"{os.getuid()}:{os.getgid()}")
             self.assertEqual(args[args.index("-w") + 1], str(ROOT))
+
+    def test_same_checkpoint_and_cache_mount_is_not_duplicated(self):
+        with tempfile.TemporaryDirectory(dir=os.path.expanduser("~")) as tmp:
+            cache = Path(tmp) / "checkpoints"
+            model = cache / "CAE-FastWAM"
+            model.mkdir(parents=True)
+            checkpoint = model / "policy.pt"
+            checkpoint.write_text("x")
+            result = self.run_helper(tmp, {
+                "EVAL_IMAGE": "img", "CAE_FASTWAM_CKPT": str(checkpoint),
+                "HF_CACHE_DIR": str(cache),
+            }, "true")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = result.stdout.splitlines()
+            volumes = [args[i + 1] for i, arg in enumerate(args) if arg == "-v"]
+            matches = [v for v in volumes if v.split(":")[1] == str(cache)]
+            self.assertEqual(matches, [f"{cache}:{cache}:rw"])
 
     def test_inside_the_image_runs_the_command_directly(self):
         with tempfile.TemporaryDirectory() as tmp:

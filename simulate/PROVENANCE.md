@@ -20,7 +20,8 @@ Not included: other framework integrations, tests, tools and benchmarks.
 Every reset is LIBERO's own (hard) reset of the reference env, so fixture placements are sampled exactly as on
 CPU MuJoCo. All world-fixed body poses are then published to the GPU model at full precision.
 `HP_SOFT_FIRST_RESET=1` is a speed-only option. It skips the hard reset on a slot's first reset and keeps the
-constructor's fixture placement instead. It is off by default.
+constructor's fixture placement instead. It is off by default in the package; `eval/native/run_fastwam_libero.sh
+--mode batched` turns it on, because each of its worlds is a freshly constructed env.
 
 The validated settings are package defaults (`instinct_sim_libero/__init__.py`): `HP_RENDERER=rt` (ray tracer, no antialiasing),
 `HP_OBS_LAG=2`, `HP_PERCAM_MAX_ENVS=0`, `HP_SUCCESS_MODE=robosuite`.

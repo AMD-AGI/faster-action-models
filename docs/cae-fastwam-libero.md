@@ -342,3 +342,36 @@ MI350X/MI355X, and `--gpus 0,1,2,3` spreads each suite's tasks over four GPUs; s
 The GEMM tuning table in `src/cae-fastwam` (`FASTWAM_R2_TUNE`) was recorded on an MI355X and is
 used only there; on other GPUs, including MI350X, torch's default GEMM selection is used. The
 reference latencies are MI355X numbers.
+
+With `--sim instinct`, `--mode batched` runs all trials of a task in lockstep on
+one N-world GPU engine ([`eval/native/README.md`](../eval/native/README.md#serial-vs-batched)).
+For `--arm cae` it still calls the model once per observation, at batch 1,
+through the evaluator's own `_predict_action_chunk` (the GEAK kernels of
+`src/cae-fastwam` are single-batch), one suite at a time:
+
+```bash
+(cd .. && bash eval/native/run_fastwam_libero.sh --sim instinct --mode batched --arm cae --steps 4 --gpus 0 --full)
+```
+
+Each model call is the serial one, so per-decision latency is unchanged; the
+wall time drops because the simulator steps all worlds at once. Each trial has
+its own LIBERO env, so its fixture placements are other draws from the same
+distribution, not identical initial scenes. Sharing the model call path does not
+establish equivalent Success rate. The success rates in the table above were measured with one policy
+decision at a time, not with `--mode batched`.
+
+A serial and batched comparison on one MI350X, `--sim instinct`, libero_spatial,
+50 trials per task (500 episodes per cell, seed 42):
+
+| Steps | Serial Success rate | Serial wall | Batched Success rate | Batched wall |
+|---|---|---|---|---|
+| 4 | 97.2% (486/500) | 46 min | 96.6% (483/500) | 26 min |
+| 10 | 97.8% (489/500) | 47 min | 97.2% (486/500) | 26 min |
+
+Batched Success rate was 0.6 percentage points lower at both step counts. The
+two-proportion tests did not detect a difference (p > 0.5); this does not prove
+equivalence. These are single spatial-suite runs, not all-suite validation or
+reproductions of the MI355X ROCm blog results. They predate the latest-main
+integration and used `FASTWAM_R2_TUNE=0` on MI350X. About half of the batched wall
+time is spent building the 50 LIBERO environments of each task on the CPU; the
+model calls take about a sixth.
